@@ -104,11 +104,23 @@ app.post('/api/sellers/login', async (req, res) => {
 
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
-        const settings = await sql`SELECT name, email, pushinpay_token, bot_name FROM sellers WHERE id = ${req.user.id}`;
-        const pixels = await sql`SELECT * FROM pixel_configurations WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
+        const settingsPromise = sql`SELECT name, email, pushinpay_token, bot_name FROM sellers WHERE id = ${req.user.id}`;
+        const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
+        
+        const statsPromise = sql`
+            SELECT 
+                COUNT(*) AS pix_generated,
+                COUNT(*) FILTER (WHERE is_converted = TRUE) AS pix_paid
+            FROM clicks
+            WHERE seller_id = ${req.user.id} AND timestamp >= NOW() - INTERVAL '30 days'
+        `;
+
+        const [settingsResult, pixelsResult, statsResult] = await Promise.all([settingsPromise, pixelsPromise, statsPromise]);
+
         res.json({
-            settings: settings[0],
-            pixels: pixels
+            settings: settingsResult[0] || {},
+            pixels: pixelsResult || [],
+            stats: statsResult[0] || { pix_generated: 0, pix_paid: 0 }
         });
     } catch (error) {
         console.error("Dashboard Data Error:", error);
