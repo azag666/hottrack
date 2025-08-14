@@ -1,0 +1,17 @@
+{
+  "name": "saas-lead-tracker-api",
+  "version": "1.0.0",
+  "description": "API SAAS para tracking de leads e conversões PIX.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.9.4",
+    "axios": "^1.7.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "uuid": "^10.0.0"
+  }
+}
