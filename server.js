@@ -90,7 +90,17 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const settingsPromise = sql`SELECT name, email, pushinpay_token FROM sellers WHERE id = ${req.user.id}`;
         const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
-        const statsPromise = sql`SELECT COUNT(*) AS pix_generated, COUNT(*) FILTER (WHERE is_converted = TRUE) AS pix_paid FROM clicks WHERE seller_id = ${req.user.id} AND timestamp >= NOW() - INTERVAL '30 days'`;
+        
+        // BUG FIX: A query agora conta da tabela 'pix_transactions' e faz o join com 'clicks'
+        const statsPromise = sql`
+            SELECT 
+                COUNT(pt.id) AS pix_generated,
+                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS pix_paid
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${req.user.id} AND pt.created_at >= NOW() - INTERVAL '30 days'
+        `;
+        
         const topStatesPromise = sql`SELECT state, COUNT(*) as count FROM clicks WHERE seller_id = ${req.user.id} AND state IS NOT NULL AND state != 'Desconhecido' AND state != 'Local' GROUP BY state ORDER BY count DESC LIMIT 5`;
 
         const [settingsResult, pixelsResult, statsResult, topStatesResult] = await Promise.all([settingsPromise, pixelsPromise, statsPromise, topStatesPromise]);
@@ -101,11 +111,14 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
             stats: statsResult[0] || { pix_generated: 0, pix_paid: 0 },
             topStates: topStatesResult || []
         });
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' }); }
+    } catch (error) { 
+        console.error("Dashboard Data Error:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' }); 
+    }
 });
 
 app.put('/api/sellers/update-settings', authenticateJwt, async (req, res) => {
-    const { pushinpay_token } = req.body; // Apenas o token da PushinPay
+    const { pushinpay_token } = req.body;
     try {
         await sql`UPDATE sellers SET pushinpay_token = ${pushinpay_token} WHERE id = ${req.user.id}`;
         res.status(200).json({ message: 'Configurações atualizadas com sucesso.' });
@@ -170,19 +183,11 @@ app.post('/api/registerClick', async (req, res) => {
 app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => {
     let { click_id } = req.body;
     if (!click_id) return res.status(400).json({ message: 'O campo click_id é obrigatório.' });
-    
-    // CORREÇÃO: Garante que o formato está correto para a busca
-    if (!click_id.startsWith('/start ')) {
-        click_id = `/start ${click_id}`;
-    }
-
+    if (!click_id.startsWith('/start ')) { click_id = `/start ${click_id}`; }
     try {
         const result = await sql`SELECT city FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
-        if (result.length > 0) {
-            res.status(200).json({ city: result[0].city || 'N/A' });
-        } else {
-            res.status(404).json({ message: 'Click ID não encontrado.' });
-        }
+        if (result.length > 0) { res.status(200).json({ city: result[0].city || 'N/A' }); } 
+        else { res.status(404).json({ message: 'Click ID não encontrado.' }); }
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
@@ -191,12 +196,7 @@ app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => {
     let { click_id, value_cents } = req.body;
     if (!pushinpay_token) return res.status(400).json({ message: 'Vendedor sem token da PushinPay configurado.' });
     if (!click_id || !value_cents) return res.status(400).json({ message: 'click_id e value_cents são obrigatórios.' });
-    
-    // CORREÇÃO: Garante que o formato está correto para a busca
-    if (!click_id.startsWith('/start ')) {
-        click_id = `/start ${click_id}`;
-    }
-
+    if (!click_id.startsWith('/start ')) { click_id = `/start ${click_id}`; }
     try {
         const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
@@ -221,12 +221,7 @@ app.post('/api/manychat/check-status-by-clickid', authenticateApiKey, async (req
     const { pushinpay_token } = req.seller;
     if (!click_id) return res.status(400).json({ message: 'O campo click_id é obrigatório.' });
     if (!pushinpay_token) return res.status(400).json({ message: 'Vendedor sem token da PushinPay configurado.' });
-
-    // CORREÇÃO: Garante que o formato está correto para a busca
-    if (!click_id.startsWith('/start ')) {
-        click_id = `/start ${click_id}`;
-    }
-
+    if (!click_id.startsWith('/start ')) { click_id = `/start ${click_id}`; }
     try {
         const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
