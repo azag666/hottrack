@@ -13,6 +13,9 @@ app.use(express.json());
 
 const sql = neon(process.env.DATABASE_URL);
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-jwt-super-secreto-padrao';
+const PUSHINPAY_API_URL = 'https://api.pushinpay.com.br';
+const YOUR_PUSHINPAY_ACCOUNT_ID = '9F49A790-2C45-4413-9974-451D657314AF'; // Seu ID para split
+const SPLIT_VALUE_CENTS = 30;
 
 // #################### MIDDLEWARES DE AUTENTICAÇÃO ###################
 
