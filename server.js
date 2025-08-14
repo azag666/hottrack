@@ -105,7 +105,7 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
 });
 
 app.put('/api/sellers/update-settings', authenticateJwt, async (req, res) => {
-    const { pushinpay_token } = req.body;
+    const { pushinpay_token } = req.body; // Apenas o token da PushinPay
     try {
         await sql`UPDATE sellers SET pushinpay_token = ${pushinpay_token} WHERE id = ${req.user.id}`;
         res.status(200).json({ message: 'Configurações atualizadas com sucesso.' });
@@ -155,10 +155,11 @@ app.post('/api/registerClick', async (req, res) => {
         const result = await sql`INSERT INTO clicks (seller_id, ip_address, user_agent, referer, city, state, fbclid, fbp) VALUES (${seller_id}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbp}) RETURNING id;`;
         
         const generatedId = result[0].id;
-        const clickIdForDb = `/start lead${generatedId.toString().padStart(6, '0')}`;
+        const cleanClickId = `lead${generatedId.toString().padStart(6, '0')}`;
+        const clickIdForDb = `/start ${cleanClickId}`;
         await sql`UPDATE clicks SET click_id = ${clickIdForDb} WHERE id = ${generatedId}`;
 
-        res.status(200).json({ status: 'success', message: 'Click registrado', click_id: `lead${generatedId.toString().padStart(6, '0')}` });
+        res.status(200).json({ status: 'success', message: 'Click registrado', click_id: cleanClickId });
     } catch (error) {
         console.error("Register Click Error:", error);
         res.status(500).json({ message: 'Erro interno do servidor.' });
@@ -167,11 +168,16 @@ app.post('/api/registerClick', async (req, res) => {
 
 // Rotas do ManyChat
 app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => {
-    const { click_id } = req.body;
+    let { click_id } = req.body;
     if (!click_id) return res.status(400).json({ message: 'O campo click_id é obrigatório.' });
+    
+    // CORREÇÃO: Garante que o formato está correto para a busca
+    if (!click_id.startsWith('/start ')) {
+        click_id = `/start ${click_id}`;
+    }
+
     try {
-        const clickIdForDb = `/start ${click_id}`;
-        const result = await sql`SELECT city FROM clicks WHERE click_id = ${clickIdForDb} AND seller_id = ${req.seller.id}`;
+        const result = await sql`SELECT city FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
         if (result.length > 0) {
             res.status(200).json({ city: result[0].city || 'N/A' });
         } else {
@@ -182,12 +188,17 @@ app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => {
 
 app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => {
     const { pushinpay_token } = req.seller;
-    const { click_id, value_cents } = req.body;
+    let { click_id, value_cents } = req.body;
     if (!pushinpay_token) return res.status(400).json({ message: 'Vendedor sem token da PushinPay configurado.' });
     if (!click_id || !value_cents) return res.status(400).json({ message: 'click_id e value_cents são obrigatórios.' });
+    
+    // CORREÇÃO: Garante que o formato está correto para a busca
+    if (!click_id.startsWith('/start ')) {
+        click_id = `/start ${click_id}`;
+    }
+
     try {
-        const clickIdForDb = `/start ${click_id}`;
-        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${clickIdForDb} AND seller_id = ${req.seller.id}`;
+        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = clickResult[0].id;
 
@@ -206,13 +217,18 @@ app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => {
 });
 
 app.post('/api/manychat/check-status-by-clickid', authenticateApiKey, async (req, res) => {
-    const { click_id } = req.body;
+    let { click_id } = req.body;
     const { pushinpay_token } = req.seller;
     if (!click_id) return res.status(400).json({ message: 'O campo click_id é obrigatório.' });
     if (!pushinpay_token) return res.status(400).json({ message: 'Vendedor sem token da PushinPay configurado.' });
+
+    // CORREÇÃO: Garante que o formato está correto para a busca
+    if (!click_id.startsWith('/start ')) {
+        click_id = `/start ${click_id}`;
+    }
+
     try {
-        const clickIdForDb = `/start ${click_id}`;
-        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${clickIdForDb} AND seller_id = ${req.seller.id}`;
+        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${req.seller.id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = clickResult[0].id;
 
@@ -256,6 +272,45 @@ app.post('/api/webhooks/pushinpay', async (req, res) => {
 });
 
 // Função para enviar conversão para a Meta
-async function sendConversionToMeta(clickData) { /* ...código anterior... */ }
+async function sendConversionToMeta(clickData) {
+    console.log('Iniciando envio de conversão para a Meta:', clickData.click_id);
+    try {
+        const pixels = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE seller_id = ${clickData.seller_id}`;
+        if (pixels.length === 0) {
+            console.warn(`Nenhum pixel configurado para o vendedor ID ${clickData.seller_id}.`);
+            return;
+        }
+        const eventTime = Math.floor(Date.now() / 1000);
+        for (const pixel of pixels) {
+            const eventId = uuidv4();
+            const metaApiUrl = `https://graph.facebook.com/v19.0/${pixel.pixel_id}/events`;
+            const payload = {
+                data: [{
+                    event_name: 'Purchase',
+                    event_time: eventTime,
+                    event_id: eventId,
+                    action_source: 'website',
+                    user_data: {
+                        client_ip_address: clickData.ip_address,
+                        client_user_agent: clickData.user_agent,
+                        fbp: clickData.fbp || null, fbc: clickData.fbc || null,
+                        ct: crypto.createHash('sha256').update(String(clickData.city || '').trim().toLowerCase()).digest('hex'),
+                        st: crypto.createHash('sha256').update(String(clickData.state || '').trim().toLowerCase()).digest('hex'),
+                        external_id: clickData.click_id
+                    },
+                    custom_data: { currency: 'BRL', value: clickData.pix_value },
+                }],
+            };
+            try {
+                await axios.post(metaApiUrl, payload, { headers: { 'Authorization': `Bearer ${pixel.meta_api_token}` } });
+                console.log(`Conversão enviada com sucesso para o Pixel ${pixel.pixel_id}`);
+            } catch (metaError) {
+                console.error(`ERRO ao enviar evento para o Pixel ${pixel.pixel_id}:`, metaError.response ? metaError.response.data : metaError.message);
+            }
+        }
+    } catch (error) {
+        console.error('Erro geral na função sendConversionToMeta:', error);
+    }
+}
 
 module.exports = app;
