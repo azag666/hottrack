@@ -17,6 +17,12 @@ const PUSHINPAY_API_URL = 'https://api.pushinpay.com.br';
 const YOUR_PUSHINPAY_ACCOUNT_ID = '9F49A790-2C45-4413-9974-451D657314AF';
 const SPLIT_VALUE_CENTS = 30;
 
+// Função de Hashing para a Meta
+function sha256(value) {
+    if (!value) return null;
+    return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
+}
+
 // Função para obter geolocalização por IP
 async function getGeoFromIp(ip) {
     if (!ip || ip === '::1') return { city: 'Local', state: 'Local' };
@@ -91,7 +97,6 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         const settingsPromise = sql`SELECT name, email, pushinpay_token FROM sellers WHERE id = ${req.user.id}`;
         const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
         
-        // BUG FIX: A query agora conta da tabela 'pix_transactions' e faz o join com 'clicks'
         const statsPromise = sql`
             SELECT 
                 COUNT(pt.id) AS pix_generated,
@@ -191,6 +196,17 @@ app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
+app.post('/api/manychat/update-customer-data', authenticateApiKey, async (req, res) => {
+    let { click_id, email, first_name, last_name, phone } = req.body;
+    if (!click_id) return res.status(400).json({ message: 'O campo click_id é obrigatório.' });
+    if (!click_id.startsWith('/start ')) { click_id = `/start ${click_id}`; }
+    try {
+        const result = await sql`UPDATE clicks SET email = COALESCE(${email}, email), first_name = COALESCE(${first_name}, first_name), last_name = COALESCE(${last_name}, last_name), phone = COALESCE(${phone}, phone) WHERE click_id = ${click_id} AND seller_id = ${req.seller.id} RETURNING id;`;
+        if (result.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
+        res.status(200).json({ status: 'success', message: 'Dados do cliente atualizados.' });
+    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+});
+
 app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => {
     const { pushinpay_token } = req.seller;
     let { click_id, value_cents } = req.body;
@@ -271,36 +287,45 @@ async function sendConversionToMeta(clickData) {
     console.log('Iniciando envio de conversão para a Meta:', clickData.click_id);
     try {
         const pixels = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE seller_id = ${clickData.seller_id}`;
-        if (pixels.length === 0) {
-            console.warn(`Nenhum pixel configurado para o vendedor ID ${clickData.seller_id}.`);
-            return;
-        }
+        if (pixels.length === 0) return;
+
         const eventTime = Math.floor(Date.now() / 1000);
+
         for (const pixel of pixels) {
             const eventId = uuidv4();
             const metaApiUrl = `https://graph.facebook.com/v19.0/${pixel.pixel_id}/events`;
+
+            const user_data = {
+                client_ip_address: clickData.ip_address,
+                client_user_agent: clickData.user_agent,
+                fbp: clickData.fbp || null,
+                fbc: clickData.fbc || null,
+                external_id: clickData.click_id
+            };
+            
+            if (clickData.email) user_data.em = sha256(clickData.email);
+            if (clickData.phone) user_data.ph = sha256(clickData.phone);
+            if (clickData.first_name) user_data.fn = sha256(clickData.first_name);
+            if (clickData.last_name) user_data.ln = sha256(clickData.last_name);
+            if (clickData.city) user_data.ct = sha256(clickData.city);
+            if (clickData.state) user_data.st = sha256(clickData.state);
+
             const payload = {
                 data: [{
                     event_name: 'Purchase',
                     event_time: eventTime,
                     event_id: eventId,
                     action_source: 'website',
-                    user_data: {
-                        client_ip_address: clickData.ip_address,
-                        client_user_agent: clickData.user_agent,
-                        fbp: clickData.fbp || null, fbc: clickData.fbc || null,
-                        ct: crypto.createHash('sha256').update(String(clickData.city || '').trim().toLowerCase()).digest('hex'),
-                        st: crypto.createHash('sha256').update(String(clickData.state || '').trim().toLowerCase()).digest('hex'),
-                        external_id: clickData.click_id
-                    },
+                    user_data: user_data,
                     custom_data: { currency: 'BRL', value: clickData.pix_value },
                 }],
             };
+
             try {
                 await axios.post(metaApiUrl, payload, { headers: { 'Authorization': `Bearer ${pixel.meta_api_token}` } });
                 console.log(`Conversão enviada com sucesso para o Pixel ${pixel.pixel_id}`);
             } catch (metaError) {
-                console.error(`ERRO ao enviar evento para o Pixel ${pixel.pixel_id}:`, metaError.response ? metaError.response.data : metaError.message);
+                console.error(`ERRO ao enviar evento para o Pixel ${pixel.pixel_id}:`, metaError.response ? metaError.response.data.error : metaError.message);
             }
         }
     } catch (error) {
