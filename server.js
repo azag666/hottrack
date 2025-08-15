@@ -229,11 +229,12 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     }
     const sanitizedBotName = bot_name.replace(/^@/, '');
     try {
-        // CORREÇÃO: A query de inserção agora inclui a coluna 'redirect_url_b' com o valor NULL
-        // para garantir compatibilidade com o schema do banco de dados, evitando o erro 500.
+        // CORREÇÃO DEFINITIVA: A query de inserção agora é mais simples e robusta.
+        // Ela insere apenas os campos que o formulário envia, ignorando colunas antigas como 'redirect_url_a/b'.
+        // Isso evita erros caso a estrutura da sua tabela seja diferente.
         const newPressel = await sql`
-            INSERT INTO pressels (seller_id, name, pixel_ids, bot_name, white_page_url, redirect_url_a, redirect_url_b)
-            VALUES (${req.user.id}, ${name}, ${pixel_ids}, ${sanitizedBotName}, ${white_page_url}, ${`https://t.me/${sanitizedBotName}`}, NULL)
+            INSERT INTO pressels (seller_id, name, pixel_ids, bot_name, white_page_url)
+            VALUES (${req.user.id}, ${name}, ${pixel_ids}, ${sanitizedBotName}, ${white_page_url})
             RETURNING *;
         `;
         res.status(201).json(newPressel[0]);
