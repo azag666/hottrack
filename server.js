@@ -95,7 +95,7 @@ app.post('/api/sellers/login', async (req, res) => {
     }
 });
 
-// --- Rotas do Dashboard (CORRIGIDO) ---
+// --- Rotas do Dashboard ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -103,7 +103,6 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         const settingsPromise = sql`SELECT name, email, pushinpay_token, api_key FROM sellers WHERE id = ${sellerId}`;
         const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
         
-        // CORREÇÃO: As queries foram reescritas com subqueries para garantir 100% de precisão nos dados.
         const statsPromise = sql`
             SELECT 
                 (SELECT COUNT(*) FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.seller_id = ${sellerId}) AS pix_generated,
@@ -221,17 +220,19 @@ app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
 });
 
 
-// --- ROTAS DE PRESSEL (CRUD) ---
+// --- ROTAS DE PRESSEL (CRUD - CORRIGIDO) ---
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
-    const { name, pixel_ids, bot_name, white_page_url, redirect_url_a } = req.body;
-    if (!name || !pixel_ids || pixel_ids.length === 0 || !bot_name || !white_page_url || !redirect_url_a) {
+    const { name, pixel_ids, bot_name, white_page_url } = req.body;
+    
+    // Validação no servidor
+    if (!name || !pixel_ids || pixel_ids.length === 0 || !bot_name || !white_page_url) {
         return res.status(400).json({ message: 'Todos os campos obrigatórios devem ser preenchidos.' });
     }
     const sanitizedBotName = bot_name.replace(/^@/, '');
     try {
         const newPressel = await sql`
-            INSERT INTO pressels (seller_id, name, pixel_ids, bot_name, white_page_url, redirect_url_a, redirect_url_b)
-            VALUES (${req.user.id}, ${name}, ${pixel_ids}, ${sanitizedBotName}, ${white_page_url}, ${redirect_url_a}, NULL)
+            INSERT INTO pressels (seller_id, name, pixel_ids, bot_name, white_page_url, redirect_url_a)
+            VALUES (${req.user.id}, ${name}, ${pixel_ids}, ${sanitizedBotName}, ${white_page_url}, ${`https://t.me/${sanitizedBotName}`})
             RETURNING *;
         `;
         res.status(201).json(newPressel[0]);
