@@ -17,11 +17,12 @@ const PUSHINPAY_API_URL = 'https://api.pushinpay.com.br';
 const YOUR_PUSHINPAY_ACCOUNT_ID = '9F49A790-2C45-4413-9974-451D657314AF';
 const SPLIT_VALUE_CENTS = 30;
 
-// Funções Utilitárias
+// --- Funções Utilitárias ---
 function sha256(value) {
     if (!value) return null;
     return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
 }
+
 async function getGeoFromIp(ip) {
     if (!ip || ip === '::1') return { city: 'Local', state: 'Local' };
     try {
@@ -36,7 +37,7 @@ async function getGeoFromIp(ip) {
     }
 }
 
-// Middlewares de Autenticação
+// --- Middlewares de Autenticação ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -47,6 +48,7 @@ async function authenticateJwt(req, res, next) {
         next();
     });
 }
+
 async function authenticateApiKey(req, res, next) {
     const apiKey = req.headers['x-api-key'];
     if (!apiKey) return res.status(401).json({ message: 'Chave de API não fornecida.' });
@@ -58,7 +60,7 @@ async function authenticateApiKey(req, res, next) {
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 }
 
-// Rotas de Autenticação
+// --- Rotas de Autenticação ---
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ message: 'Nome, email e senha são obrigatórios.' });
@@ -72,6 +74,7 @@ app.post('/api/sellers/register', async (req, res) => {
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!', seller: newSeller[0] });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
+
 app.post('/api/sellers/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
@@ -88,25 +91,58 @@ app.post('/api/sellers/login', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
-// Rotas do Dashboard
+// --- Rotas do Dashboard ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
-        const settingsPromise = sql`SELECT name, email, pushinpay_token FROM sellers WHERE id = ${req.user.id}`;
-        const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
-        const presselsPromise = sql`SELECT * FROM pressels WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
-        const statsPromise = sql`SELECT COUNT(pt.id) AS pix_generated, COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS pix_paid FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.seller_id = ${req.user.id} AND pt.created_at >= NOW() - INTERVAL '30 days'`;
-        const topStatesPromise = sql`SELECT state, COUNT(*) as count FROM clicks WHERE seller_id = ${req.user.id} AND state IS NOT NULL AND state != 'Desconhecido' AND state != 'Local' GROUP BY state ORDER BY count DESC LIMIT 5`;
-        const hourlyTrafficPromise = sql`SELECT EXTRACT(HOUR FROM timestamp) as hour, COUNT(*) as count FROM clicks WHERE seller_id = ${req.user.id} AND timestamp >= NOW() - INTERVAL '1 day' GROUP BY hour ORDER BY hour`;
+        const sellerId = req.user.id;
+        
+        // Consultas em paralelo para mais performance
+        const settingsPromise = sql`SELECT name, email, pushinpay_token, api_key FROM sellers WHERE id = ${sellerId}`;
+        const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
+        const presselsPromise = sql`SELECT * FROM pressels WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
+        
+        // Estatísticas gerais
+        const statsPromise = sql`
+            SELECT 
+                COUNT(pt.id) AS pix_generated, 
+                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS pix_paid,
+                COALESCE(SUM(pt.value_cents) FILTER (WHERE pt.status = 'paid'), 0) / 100.0 AS total_revenue
+            FROM pix_transactions pt 
+            JOIN clicks c ON pt.click_id_internal = c.id 
+            WHERE c.seller_id = ${sellerId} AND pt.created_at >= NOW() - INTERVAL '30 days'`;
 
-        const [settingsResult, pixelsResult, presselsResult, statsResult, topStatesResult, hourlyTrafficResult] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, statsPromise, topStatesPromise, hourlyTrafficPromise]);
+        // NOVAS ESTATÍSTICAS
+        const topStatesPromise = sql`SELECT state, COUNT(*) as count FROM clicks WHERE seller_id = ${sellerId} AND state IS NOT NULL AND state NOT IN ('Desconhecido', 'Local', 'Erro') GROUP BY state ORDER BY count DESC LIMIT 5`;
+        const topCampaignsPromise = sql`SELECT utm_campaign, COUNT(*) as count FROM clicks WHERE seller_id = ${sellerId} AND utm_campaign IS NOT NULL GROUP BY utm_campaign ORDER BY count DESC LIMIT 5`;
+        const topSourcesPromise = sql`SELECT utm_source, COUNT(*) as count FROM clicks WHERE seller_id = ${sellerId} AND utm_source IS NOT NULL GROUP BY utm_source ORDER BY count DESC LIMIT 5`;
+
+        const [
+            settingsResult, 
+            pixelsResult, 
+            presselsResult, 
+            statsResult, 
+            topStatesResult, 
+            topCampaignsResult, 
+            topSourcesResult
+        ] = await Promise.all([
+            settingsPromise, 
+            pixelsPromise, 
+            presselsPromise, 
+            statsPromise, 
+            topStatesPromise, 
+            topCampaignsPromise, 
+            topSourcesPromise
+        ]);
 
         res.json({
             settings: settingsResult[0] || {},
             pixels: pixelsResult || [],
             pressels: presselsResult || [],
-            stats: statsResult[0] || { pix_generated: 0, pix_paid: 0 },
+            stats: statsResult[0] || { pix_generated: 0, pix_paid: 0, total_revenue: 0 },
+            // NOVOS DADOS
             topStates: topStatesResult || [],
-            hourlyTraffic: hourlyTrafficResult || []
+            topCampaigns: topCampaignsResult || [],
+            topSources: topSourcesResult || []
         });
     } catch (error) { 
         console.error("Dashboard Data Error:", error);
@@ -122,21 +158,24 @@ app.put('/api/sellers/update-settings', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao atualizar configurações.' }); }
 });
 
-// Rotas de PIXELS
-app.post('/api/pixels', authenticateJwt, async (req, res) => { /* ...código anterior... */ });
-app.put('/api/pixels/:id', authenticateJwt, async (req, res) => { /* ...código anterior... */ });
-app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => { /* ...código anterior... */ });
+// --- Rotas de PIXELS ---
+// (Mantenha suas rotas de pixels existentes aqui)
+app.post('/api/pixels', authenticateJwt, async (req, res) => { /* ...seu código... */ });
+app.put('/api/pixels/:id', authenticateJwt, async (req, res) => { /* ...seu código... */ });
+app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => { /* ...seu código... */ });
 
-// ROTAS DE PRESSEL
+
+// --- ROTAS DE PRESSEL ---
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
-    const { name, pixel_config_id, bot_name, white_page_url, redirect_desktop, redirect_mobile } = req.body;
-    if (!name || !pixel_config_id || !bot_name || !white_page_url) {
-        return res.status(400).json({ message: 'Todos os campos da pressel são obrigatórios.' });
+    // NOVO: Adicionando campos para teste A/B
+    const { name, pixel_config_id, bot_name, white_page_url, redirect_url_a, redirect_url_b } = req.body;
+    if (!name || !pixel_config_id || !bot_name || !white_page_url || !redirect_url_a) {
+        return res.status(400).json({ message: 'Campos obrigatórios da pressel não foram preenchidos.' });
     }
     try {
         const newPressel = await sql`
-            INSERT INTO pressels (seller_id, name, pixel_config_id, bot_name, white_page_url, redirect_desktop, redirect_mobile)
-            VALUES (${req.user.id}, ${name}, ${pixel_config_id}, ${bot_name}, ${white_page_url}, ${redirect_desktop}, ${redirect_mobile})
+            INSERT INTO pressels (seller_id, name, pixel_config_id, bot_name, white_page_url, redirect_url_a, redirect_url_b)
+            VALUES (${req.user.id}, ${name}, ${pixel_config_id}, ${bot_name}, ${white_page_url}, ${redirect_url_a}, ${redirect_url_b})
             RETURNING *;
         `;
         res.status(201).json(newPressel[0]);
@@ -157,19 +196,66 @@ app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
     }
 });
 
-// Rota de Registro de Clique
-app.post('/api/registerClick', async (req, res) => { /* ...código anterior... */ });
+// --- Rota de Registro de Clique (ATUALIZADA) ---
+app.post('/api/registerClick', async (req, res) => {
+    const { 
+        sellerApiKey, 
+        referer, 
+        fbclid, 
+        fbp,
+        // NOVOS CAMPOS
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_term,
+        utm_content,
+        user_agent
+    } = req.body;
 
-// Rotas do ManyChat
-app.post('/api/manychat/update-customer-data', authenticateApiKey, async (req, res) => { /* ...código anterior... */ });
-app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => { /* ...código anterior... */ });
-app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => { /* ...código anterior... */ });
-app.post('/api/manychat/check-status-by-clickid', authenticateApiKey, async (req, res) => { /* ...código anterior... */ });
+    if (!sellerApiKey) return res.status(400).json({ message: 'sellerApiKey é obrigatório' });
 
-// Webhook
-app.post('/api/webhooks/pushinpay', async (req, res) => { /* ...código anterior... */ });
+    try {
+        const sellerResult = await sql`SELECT id FROM sellers WHERE api_key = ${sellerApiKey}`;
+        if (sellerResult.length === 0) return res.status(403).json({ message: 'Chave de API inválida.' });
+        const seller_id = sellerResult[0].id;
 
-// Função para enviar conversão para a Meta
-async function sendConversionToMeta(clickData) { /* ...código anterior... */ }
+        const click_id_internal = uuidv4();
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const { city, state } = await getGeoFromIp(ip);
+        
+        // ATENÇÃO: Você precisa adicionar essas colunas na sua tabela 'clicks' no banco de dados.
+        // Ex: ALTER TABLE clicks ADD COLUMN utm_source VARCHAR(255);
+        // ... e assim por diante para cada coluna utm_ e user_agent.
+        await sql`
+            INSERT INTO clicks (
+                id, seller_id, ip_address, city, state, referer, fbclid, fbp,
+                utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent
+            ) VALUES (
+                ${click_id_internal}, ${seller_id}, ${ip}, ${city}, ${state}, ${referer}, ${fbclid}, ${fbp},
+                ${utm_source}, ${utm_medium}, ${utm_campaign}, ${utm_term}, ${utm_content}, ${user_agent}
+            )
+        `;
+        
+        res.status(200).json({ click_id: click_id_internal });
+    } catch (error) {
+        console.error('Erro ao registrar clique:', error);
+        // Retorna um objeto de erro vazio para não quebrar o redirecionamento do cliente
+        res.status(500).json({});
+    }
+});
+
+
+// --- Rotas do ManyChat ---
+// (Mantenha suas rotas do ManyChat existentes aqui)
+app.post('/api/manychat/update-customer-data', authenticateApiKey, async (req, res) => { /* ...seu código... */ });
+app.post('/api/manychat/get-city', authenticateApiKey, async (req, res) => { /* ...seu código... */ });
+app.post('/api/manychat/generate-pix', authenticateApiKey, async (req, res) => { /* ...seu código... */ });
+app.post('/api/manychat/check-status-by-clickid', authenticateApiKey, async (req, res) => { /* ...seu código... */ });
+
+// --- Webhook ---
+app.post('/api/webhooks/pushinpay', async (req, res) => { /* ...seu código... */ });
+
+// --- Função para enviar conversão para a Meta ---
+async function sendConversionToMeta(clickData) { /* ...seu código... */ }
 
 module.exports = app;
