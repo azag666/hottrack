@@ -229,9 +229,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     }
     const sanitizedBotName = bot_name.replace(/^@/, '');
     try {
-        // CORREÇÃO DEFINITIVA: A query de inserção agora é mais simples e robusta.
-        // Ela insere apenas os campos que o formulário envia, ignorando colunas antigas como 'redirect_url_a/b'.
-        // Isso evita erros caso a estrutura da sua tabela seja diferente.
         const newPressel = await sql`
             INSERT INTO pressels (seller_id, name, pixel_ids, bot_name, white_page_url)
             VALUES (${req.user.id}, ${name}, ${pixel_ids}, ${sanitizedBotName}, ${white_page_url})
