@@ -237,7 +237,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
         res.status(201).json(newPressel[0]);
     } catch (error) {
         console.error("Create Pressel Error:", error);
-        // CORREÇÃO: Envia uma mensagem de erro mais detalhada para o frontend
         res.status(500).json({ 
             message: 'Erro ao salvar a pressel no banco de dados.',
             detail: error.message 
