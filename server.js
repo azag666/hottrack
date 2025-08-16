@@ -289,10 +289,10 @@ app.post('/api/registerClick', async (req, res) => {
         await sql`
             INSERT INTO clicks (
                 id, seller_id, pressel_id, ip_address, city, state, referer, fbclid, fbp,
-                utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent
+                utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent, click_id_internal
             ) VALUES (
                 ${click_id_internal}, ${seller_id}, ${presselId}, ${ip}, ${city}, ${state}, ${referer}, ${fbclid}, ${fbp},
-                ${utm_source}, ${utm_medium}, ${utm_campaign}, ${utm_term}, ${utm_content}, ${user_agent}
+                ${utm_source}, ${utm_medium}, ${utm_campaign}, ${utm_term}, ${utm_content}, ${user_agent}, ${click_id_internal}
             )
         `;
         
