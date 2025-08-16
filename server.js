@@ -237,6 +237,7 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
         res.status(201).json(newPressel[0]);
     } catch (error) {
         console.error("Create Pressel Error:", error);
+        // CORREÇÃO: Envia uma mensagem de erro mais detalhada para o frontend
         res.status(500).json({ 
             message: 'Erro ao salvar a pressel no banco de dados.',
             detail: error.message 
@@ -289,10 +290,10 @@ app.post('/api/registerClick', async (req, res) => {
         await sql`
             INSERT INTO clicks (
                 id, seller_id, pressel_id, ip_address, city, state, referer, fbclid, fbp,
-                utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent, click_id_internal
+                utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent
             ) VALUES (
                 ${click_id_internal}, ${seller_id}, ${presselId}, ${ip}, ${city}, ${state}, ${referer}, ${fbclid}, ${fbp},
-                ${utm_source}, ${utm_medium}, ${utm_campaign}, ${utm_term}, ${utm_content}, ${user_agent}, ${click_id_internal}
+                ${utm_source}, ${utm_medium}, ${utm_campaign}, ${utm_term}, ${utm_content}, ${user_agent}
             )
         `;
         
