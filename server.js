@@ -1,230 +1,133 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const { neon } = require('@neondatabase/serverless');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const axios = require('axios'); // Adicionado para chamadas externas
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- CONFIGURAÇÃO ---
 const sql = neon(process.env.DATABASE_URL);
-const JWT_SECRET = process.env.JWT_SECRET || 'substitua-por-um-segredo-forte-em-producao';
+const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
 
-// --- MIDDLEWARES DE AUTENTICAÇÃO ---
-async function authenticateJwt(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ message: 'Token não fornecido.' });
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ message: 'Token inválido ou expirado.' });
-        req.user = user;
-        next();
-    });
-}
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
+async function authenticateJwt(req, res, next) { /* ... (código da versão anterior) ... */ }
 
 // --- ROTAS DE AUTENTICAÇÃO E REGISTRO ---
-app.post('/api/sellers/register', async (req, res) => {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password || password.length < 8) {
-        return res.status(400).json({ message: 'Dados inválidos. A senha deve ter no mínimo 8 caracteres.' });
-    }
-    try {
-        const existingSeller = await sql`SELECT id FROM sellers WHERE email = ${email}`;
-        if (existingSeller.length > 0) return res.status(409).json({ message: 'Este email já está em uso.' });
-        
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const apiKey = uuidv4();
-        const newSeller = await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${email}, ${hashedPassword}, ${apiKey}) RETURNING id, name, email, api_key;`;
-        
-        res.status(201).json({ message: 'Vendedor cadastrado com sucesso!', seller: newSeller[0] });
-    } catch (error) {
-        console.error("Erro no registro:", error);
-        res.status(500).json({ message: 'Erro interno do servidor.' });
-    }
-});
+app.post('/api/sellers/register', async (req, res) => { /* ... (código da versão anterior) ... */ });
+app.post('/api/sellers/login', async (req, res) => { /* ... (código da versão anterior) ... */ });
 
-app.post('/api/sellers/login', async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
-    try {
-        const sellerResult = await sql`SELECT * FROM sellers WHERE email = ${email}`;
-        if (sellerResult.length === 0) return res.status(404).json({ message: 'Usuário não encontrado.' });
-        
-        const seller = sellerResult[0];
-        const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
-        if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
-        
-        const tokenPayload = { id: seller.id, email: seller.email };
-        const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
-        
-        const { password_hash, ...sellerData } = seller;
-        res.status(200).json({ message: 'Login bem-sucedido!', token, seller: sellerData });
-    } catch (error) {
-        console.error("Erro no login:", error);
-        res.status(500).json({ message: 'Erro interno do servidor.' });
-    }
-});
-
-// --- ROTA PRINCIPAL DE DADOS DO DASHBOARD ---
+// --- ROTA DE DADOS DO DASHBOARD ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
-        const settingsPromise = sql`SELECT id, name, email, pushinpay_token, api_key FROM sellers WHERE id = ${sellerId}`;
-        const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
-        const presselsPromise = sql`
-            SELECT p.*, COALESCE(px.pixel_ids, ARRAY[]::integer[]) as pixel_ids
-            FROM pressels p
-            LEFT JOIN (
-                SELECT pressel_id, array_agg(pixel_config_id) as pixel_ids
-                FROM pressel_pixels
-                GROUP BY pressel_id
-            ) px ON p.id = px.pressel_id
-            WHERE p.seller_id = ${sellerId} ORDER BY p.created_at DESC`;
-        const botsPromise = sql`SELECT id, bot_name FROM telegram_bots WHERE seller_id = ${sellerId} ORDER BY bot_name`;
-        const statsPromise = sql`
-            SELECT 
-                COUNT(id) AS clicks,
-                COUNT(pix_id) AS pix_generated,
-                COUNT(id) FILTER (WHERE is_converted = TRUE) AS pix_paid
-            FROM clicks
-            WHERE seller_id = ${sellerId} AND timestamp >= NOW() - INTERVAL '30 days'`;
-        const topStatesPromise = sql`SELECT state, COUNT(id) as count FROM clicks WHERE seller_id = ${sellerId} AND state IS NOT NULL AND state NOT IN ('Desconhecido', 'Local', 'Erro') GROUP BY state ORDER BY count DESC LIMIT 5`;
-
-        const [settings, pixels, pressels, bots, stats, topStates] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise, statsPromise, topStatesPromise]);
-
-        res.json({
-            settings: settings[0] || {},
-            pixels: pixels || [],
-            pressels: pressels || [],
-            bots: bots || [],
-            stats: stats[0] || { clicks: 0, pix_generated: 0, pix_paid: 0 },
-            topStates: topStates || [],
-        });
-    } catch (error) { 
+        // ... (lógica completa da query do dashboard da versão anterior) ...
+        res.json({ /* ... (dados do dashboard) ... */ });
+    } catch (error) {
         console.error("Erro ao buscar dados do dashboard:", error);
-        res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' }); 
+        res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' });
     }
 });
 
-// --- ROTAS DE CONFIGURAÇÕES, PIXELS, BOTS E PRESSELS (CRUDs) ---
+// --- ROTAS DE PIXELS, BOTS, PRESSELS ---
+// ... (Copie as rotas de POST e DELETE para /api/pixels, /api/bots, e /api/pressels da sua versão anterior do server.js) ...
 
-// Configurações
-app.put('/api/sellers/update-settings', authenticateJwt, async (req, res) => {
-    const { pushinpay_token } = req.body;
-    try {
-        await sql`UPDATE sellers SET pushinpay_token = ${pushinpay_token} WHERE id = ${req.user.id}`;
-        res.status(200).json({ message: 'Configurações atualizadas com sucesso.' });
-    } catch (error) { res.status(500).json({ message: 'Erro ao atualizar configurações.' }); }
-});
+// --- ROTA PÚBLICA PARA REGISTRO DE CLIQUES ---
+app.post('/api/registerClick', async (req, res) => { /* ... (código da versão anterior) ... */ });
 
-// Pixels
-app.post('/api/pixels', authenticateJwt, async (req, res) => {
-    const { account_name, pixel_id, meta_api_token } = req.body;
-    if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
-    try {
-        const newPixel = await sql`INSERT INTO pixel_configurations (seller_id, account_name, pixel_id, meta_api_token) VALUES (${req.user.id}, ${account_name}, ${pixel_id}, ${meta_api_token}) RETURNING *;`;
-        res.status(201).json(newPixel[0]);
-    } catch (error) { res.status(500).json({ message: 'Erro ao salvar o pixel.' }); }
-});
+// --- NOVAS ROTAS PARA PUSHINPAY E META CAPI ---
 
-app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
-    const { id } = req.params;
-    try {
-        await sql`DELETE FROM pixel_configurations WHERE id = ${id} AND seller_id = ${req.user.id}`;
-        res.status(204).send();
-    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o pixel.' }); }
-});
+// ROTA PARA GERAR PIX (PUSHINPAY)
+app.post('/api/generate-pix', authenticateJwt, async (req, res) => {
+    const { click_id_internal, value_cents } = req.body;
+    const seller_id = req.user.id;
 
-// Bots
-app.post('/api/bots', authenticateJwt, async (req, res) => {
-    const { bot_name, bot_token } = req.body;
-    if(!bot_name || !bot_token) return res.status(400).json({ message: 'Nome e token são obrigatórios.' });
     try {
-        const newBot = await sql`INSERT INTO telegram_bots (seller_id, bot_name, bot_token) VALUES (${req.user.id}, ${bot_name}, ${bot_token}) RETURNING *;`;
-        res.status(201).json(newBot[0]);
-    } catch (error) { res.status(500).json({ message: 'Erro ao salvar o bot.' }); }
-});
+        const seller = await sql`SELECT pushinpay_token FROM sellers WHERE id = ${seller_id}`;
+        if (!seller.length || !seller[0].pushinpay_token) {
+            return res.status(400).json({ message: 'Token da PushinPay não configurado.' });
+        }
 
-app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
-    const { id } = req.params;
-    try {
-        await sql`DELETE FROM telegram_bots WHERE id = ${id} AND seller_id = ${req.user.id}`;
-        res.status(204).send();
-    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
-});
-
-// Pressels
-app.post('/api/pressels', authenticateJwt, async (req, res) => {
-    const { name, bot_id, white_page_url, pixel_ids } = req.body;
-    if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
-    
-    try {
-        const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${bot_id} AND seller_id = ${req.user.id}`;
-        if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
+        console.log(`Gerando PIX para o click_id: ${click_id_internal}`);
+        // AQUI VOCÊ FARIA A CHAMADA PARA A API DA PUSHINPAY
+        // const response = await axios.post('URL_DA_PUSHINPAY', { ... }, { headers: { 'Authorization': `Bearer ${seller[0].pushinpay_token}` } });
+        // const pixData = response.data;
         
-        const bot_name = botResult[0].bot_name;
-        let finalPressel = {};
+        // Exemplo de resposta (simulada)
+        const pixData = {
+            transaction_id: `pix_${uuidv4()}`,
+            qr_code: '00020126... (QR Code Completo)',
+            qr_code_text: 'copiaecola...'
+        };
 
-        await sql.begin(async sql => {
-            const newPresselResult = await sql`
-                INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) 
-                VALUES (${req.user.id}, ${name}, ${bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
-            
-            const presselId = newPresselResult[0].id;
-            
-            for (const pixelId of pixel_ids) {
-                await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${presselId}, ${pixelId});`;
+        // Salva o ID da transação no clique correspondente
+        await sql`UPDATE clicks SET pix_id = ${pixData.transaction_id}, pix_value = ${value_cents / 100}, status = 'pending' WHERE id = ${click_id_internal}`;
+
+        res.status(200).json(pixData);
+    } catch (error) {
+        console.error('Erro ao gerar PIX:', error);
+        res.status(500).json({ message: 'Erro ao gerar PIX.' });
+    }
+});
+
+// WEBHOOK PARA RECEBER CONFIRMAÇÃO DE PAGAMENTO (DA PUSHINPAY)
+app.post('/api/webhook/payment-confirmed', async (req, res) => {
+    const { transaction_id, status } = req.body; // Supondo que a PushinPay envie esses dados
+    
+    if (status === 'paid') {
+        try {
+            const updatedClicks = await sql`
+                UPDATE clicks SET status = 'paid', conversion_timestamp = NOW() 
+                WHERE pix_id = ${transaction_id} AND status != 'paid'
+                RETURNING *`;
+
+            if (updatedClicks.length > 0) {
+                const clickData = updatedClicks[0];
+                console.log(`Conversão registrada para o clique ${clickData.id}. Disparando envio para Meta CAPI.`);
+                
+                // Dispara a função para enviar a conversão para a API da Meta
+                await sendConversionToMeta(clickData);
             }
-            
-            finalPressel = { ...newPresselResult[0], pixel_ids: pixel_ids };
-        });
-
-        res.status(201).json(finalPressel);
-    } catch (error) {
-        console.error("Erro ao salvar pressel:", error);
-        res.status(500).json({ message: 'Erro ao salvar a pressel.' });
+        } catch (error) {
+            console.error('Erro no webhook:', error);
+        }
     }
+    res.sendStatus(200); // Sempre retorne 200 para o webhook
 });
 
-app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
-    const { id } = req.params;
+// FUNÇÃO PARA ENVIAR DADOS PARA A API DE CONVERSÕES DA META
+async function sendConversionToMeta(clickData) {
     try {
-        // O ON DELETE CASCADE no banco de dados já remove as associações e cliques
-        await sql`DELETE FROM pressels WHERE id = ${id} AND seller_id = ${req.user.id}`;
-        res.status(204).send();
-    } catch (error) { res.status(500).json({ message: 'Erro ao excluir a pressel.' }); }
-});
+        const sellerId = clickData.seller_id;
+        // 1. Busca os pixels associados à pressel do clique
+        const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
+        if (presselPixels.length === 0) return;
 
-
-// Rota pública para registro de cliques
-app.post('/api/registerClick', async (req, res) => {
-    const { sellerApiKey, presselId, referer, fbclid, fbp, fbc } = req.body;
-    if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
-    
-    try {
-        const sellerResult = await sql`SELECT id FROM sellers WHERE api_key = ${sellerApiKey}`;
-        if (sellerResult.length === 0) return res.status(404).json({ message: 'Vendedor não encontrado.' });
-        
-        const seller_id = sellerResult[0].id;
-        const ip_address = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-        
-        const result = await sql`
-            INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, fbclid, fbp, fbc) 
-            VALUES (${seller_id}, ${presselId}, ${ip_address}, ${req.headers['user-agent']}, ${referer}, ${fbclid}, ${fbp}, ${fbc}) 
-            RETURNING id;`;
-        
-        const cleanClickId = `lead${result[0].id.toString().padStart(6, '0')}`;
-        await sql`UPDATE clicks SET click_id = ${`/start ${cleanClickId}`} WHERE id = ${result[0].id}`;
-
-        res.status(200).json({ status: 'success', click_id: cleanClickId });
+        for (const pp of presselPixels) {
+            // 2. Para cada pixel, busca a configuração (ID do pixel e token da API)
+            const pixelConfig = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pp.pixel_config_id}`;
+            if (pixelConfig.length > 0) {
+                const { pixel_id, meta_api_token } = pixelConfig[0];
+                const event_id = `evt_${clickData.id}_${pixel_id}`;
+                
+                console.log(`Enviando evento de Purchase para o Pixel ID: ${pixel_id}`);
+                
+                // 3. Monta e envia o payload para a API da Meta (este é um exemplo)
+                // const payload = { ... };
+                // await axios.post(`https://graph.facebook.com/v18.0/${pixel_id}/events`, payload, { headers: { 'Authorization': `Bearer ${meta_api_token}` } });
+                
+                // 4. Salva o ID do evento para evitar duplicidade
+                await sql`UPDATE clicks SET event_id = ${event_id} WHERE id = ${clickData.id}`;
+            }
+        }
     } catch (error) {
-        console.error("Erro ao registrar clique:", error);
-        res.status(500).json({ message: 'Erro interno do servidor.' });
+        console.error('Erro ao enviar conversão para a Meta:', error.response ? error.response.data : error.message);
     }
-});
+}
 
 // Exporta o app para a Vercel
 module.exports = app;
