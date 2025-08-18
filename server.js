@@ -10,11 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- CONFIGURAÇÃO ---
 const sql = neon(process.env.DATABASE_URL);
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
-const MY_PUSHINPAY_ACCOUNT_ID = process.env.MY_PUSHINPAY_ACCOUNT_ID; // Carrega o ID da sua conta
+const MY_PUSHINPAY_ACCOUNT_ID = process.env.MY_PUSHINPAY_ACCOUNT_ID; // O ID da sua conta para receber a comissão
 
-// MIDDLEWARE DE AUTENTICAÇÃO
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -26,7 +27,7 @@ async function authenticateJwt(req, res, next) {
     });
 }
 
-// ROTAS DE AUTENTICAÇÃO
+// --- ROTAS DE AUTENTICAÇÃO ---
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -66,7 +67,7 @@ app.post('/api/sellers/login', async (req, res) => {
     }
 });
 
-// ROTA PARA BUSCAR TODOS OS DADOS DO PAINEL
+// --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -95,7 +96,7 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     }
 });
 
-// ROTAS DE CRUD (PIXELS, BOTS, PRESSELS, SETTINGS)
+// --- ROTAS DE GERENCIAMENTO (CRUD) ---
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
@@ -149,12 +150,23 @@ app.post('/api/settings/pushinpay', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar o token.' }); }
 });
 
-// ROTA PÚBLICA PARA REGISTRO DE CLIQUES
+// --- ROTA DE RASTREAMENTO ---
 app.post('/api/registerClick', async (req, res) => {
-    const { sellerApiKey, presselId, fbclid, fbp, fbc } = req.body;
+    const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
+    
+    const ip_address = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+    let city = 'Desconhecida', state = 'Desconhecido';
     try {
-        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, fbclid, fbp, fbc) SELECT s.id, ${presselId}, ${fbclid}, ${fbp}, ${fbc} FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
+        if (ip_address) {
+            const geo = await axios.get(`http://ip-api.com/json/${ip_address}?fields=city,regionName`);
+            city = geo.data.city;
+            state = geo.data.regionName;
+        }
+    } catch (e) { console.error("Erro ao buscar geolocalização"); }
+
+    try {
+        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, city, state, fbclid, fbp, fbc) SELECT s.id, ${presselId}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbp}, ${fbc} FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
 
         const click_record_id = result[0].id;
@@ -167,44 +179,59 @@ app.post('/api/registerClick', async (req, res) => {
     }
 });
 
-// --- NOVAS FUNÇÕES: GERAÇÃO DE PIX COM SPLIT E WEBHOOK ---
+// --- ROTAS DE PIX E CONVERSÃO ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (!apiKey) return res.status(401).json({ message: 'API Key não fornecida.' });
-
     const { click_id, value_cents } = req.body;
-    if (!click_id || !value_cents) return res.status(400).json({ message: 'click_id e value_cents são obrigatórios.' });
-    if (value_cents < 100) return res.status(400).json({ message: 'O valor mínimo é de R$ 1,00.'});
+    if (!apiKey || !click_id || !value_cents) return res.status(400).json({ message: 'API Key, click_id e value_cents são obrigatórios.' });
 
     try {
         const sellerResult = await sql`SELECT id, pushinpay_token FROM sellers WHERE api_key = ${apiKey}`;
-        if (sellerResult.length === 0) return res.status(403).json({ message: 'API Key inválida.' });
-        
-        const sellerToken = sellerResult[0]?.pushinpay_token;
-        if (!sellerToken) return res.status(400).json({ message: 'Vendedor não configurou a API PIX.' });
+        const seller = sellerResult[0];
+        if (!seller?.pushinpay_token) return res.status(400).json({ message: 'API PIX não configurada pelo vendedor.' });
+
+        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id}`;
+        if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
+        const click_id_internal = clickResult[0].id;
 
         const COMMISSION_RATE = 0.0499;
         const commission_cents = Math.floor(value_cents * COMMISSION_RATE);
-        
         const split_rules = [{ value: commission_cents, account_id: MY_PUSHINPAY_ACCOUNT_ID }];
+        const webhook_url = `https://${req.headers.host}/api/webhook/pushinpay`;
 
-        const payload = {
-            value: value_cents,
-            webhook_url: `https://${req.headers.host}/api/webhook/pushinpay`,
-            split_rules: split_rules
-        };
-
-        const pushinpayResponse = await axios.post(
-            'https://api.pushinpay.com.br/api/pix/cashIn',
-            payload,
-            { headers: { 'Authorization': `Bearer ${sellerToken}`, 'Content-Type': 'application/json' }}
-        );
+        const payload = { value: value_cents, webhook_url, split_rules };
+        const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` }});
         const pixData = pushinpayResponse.data;
-        await sql`UPDATE clicks SET pix_id = ${pixData.id}, pix_value = ${value_cents / 100} WHERE click_id = ${click_id}`;
+
+        await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64})`;
         res.status(200).json({ qr_code_text: pixData.qr_code, qr_code_base64: pixData.qr_code_base64 });
     } catch (error) {
-        console.error("Erro ao gerar PIX:", error.response ? error.response.data : error.message);
+        console.error("Erro ao gerar PIX:", error.response?.data || error.message);
         res.status(500).json({ message: 'Erro ao gerar cobrança PIX.' });
+    }
+});
+
+app.post('/api/pix/check-status', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    const { click_id } = req.body;
+    if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
+    try {
+        const transactions = await sql`
+            SELECT pt.status, pt.pix_value 
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.click_id = ${click_id}`;
+        if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
+        
+        const paidTransaction = transactions.find(t => t.status === 'paid');
+        if (paidTransaction) {
+            return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value, all_transactions: transactions });
+        } else {
+            return res.status(200).json({ status: 'pending', all_transactions: transactions });
+        }
+    } catch (error) {
+        console.error("Erro ao consultar status do PIX:", error);
+        res.status(500).json({ message: 'Erro ao consultar status.' });
     }
 });
 
@@ -212,17 +239,17 @@ app.post('/api/webhook/pushinpay', async (req, res) => {
     const { id, status } = req.body;
     if (status === 'paid') {
         try {
-            const updatedClick = await sql`
-                UPDATE clicks SET status = 'paid', conversion_timestamp = NOW() 
-                WHERE pix_id = ${id} AND status != 'paid'
-                RETURNING *`;
-            if (updatedClick.length > 0) await sendConversionToMeta(updatedClick[0]);
+            const updatedTx = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE pix_id = ${id} AND status != 'paid' RETURNING *`;
+            if (updatedTx.length > 0) {
+                const click = await sql`SELECT * FROM clicks WHERE id = ${updatedTx[0].click_id_internal}`;
+                await sendConversionToMeta(click[0], updatedTx[0]);
+            }
         } catch (error) { console.error("Erro no webhook:", error); }
     }
     res.sendStatus(200);
 });
 
-async function sendConversionToMeta(clickData) {
+async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
         if (presselPixels.length === 0) return;
@@ -230,22 +257,22 @@ async function sendConversionToMeta(clickData) {
             const pixelConfig = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
             if (pixelConfig.length > 0) {
                 const { pixel_id, meta_api_token } = pixelConfig[0];
-                const event_id = `click.${clickData.id}.${pixel_id}`;
+                const event_id = `pix.${pixData.id}.${pixel_id}`;
                 const payload = {
                     data: [{
                         event_name: 'Purchase',
                         event_time: Math.floor(Date.now() / 1000),
                         event_id: event_id,
-                        user_data: { fbp: clickData.fbp, fbc: clickData.fbc },
-                        custom_data: { currency: 'BRL', value: clickData.pix_value },
+                        user_data: { fbp: clickData.fbp, fbc: clickData.fbc, client_ip_address: clickData.ip_address, client_user_agent: clickData.user_agent },
+                        custom_data: { currency: 'BRL', value: pixData.pix_value },
                     }],
                 };
                 await axios.post(`https://graph.facebook.com/v18.0/${pixel_id}/events`, payload, { params: { access_token: meta_api_token } });
-                await sql`UPDATE clicks SET event_id = ${event_id} WHERE id = ${clickData.id}`;
+                await sql`UPDATE pix_transactions SET meta_event_id = ${event_id} WHERE id = ${pixData.id}`;
             }
         }
     } catch (error) {
-        console.error('Erro ao enviar conversão para a Meta:', error.response ? error.response.data : error.message);
+        console.error('Erro ao enviar conversão para a Meta:', error.response?.data || error.message);
     }
 }
 
