@@ -13,7 +13,7 @@ app.use(express.json());
 // --- CONFIGURAÇÃO ---
 const sql = neon(process.env.DATABASE_URL);
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
-const MY_PUSHINPAY_ACCOUNT_ID = process.env.MY_PUSHINPAY_ACCOUNT_ID; // O ID da sua conta para receber a comissão
+const MY_PUSHINPAY_ACCOUNT_ID = process.env.MY_PUSHINPAY_ACCOUNT_ID;
 
 // --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
@@ -67,7 +67,7 @@ app.post('/api/sellers/login', async (req, res) => {
     }
 });
 
-// --- ROTA DE DADOS DO PAINEL ---
+// --- ROTA DE DADOS DO PAINEL (ATUALIZADA) ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -85,7 +85,7 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         const [settings, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
 
         res.json({
-            settings: settings[0] || {},
+            settings: settings[0] || { api_key: null, pushinpay_token: null }, // CORREÇÃO APLICADA AQUI
             pixels: pixels || [],
             pressels: pressels || [],
             bots: bots || [],
@@ -184,7 +184,6 @@ app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
     if (!apiKey || !click_id || !value_cents) return res.status(400).json({ message: 'API Key, click_id e value_cents são obrigatórios.' });
-
     try {
         const sellerResult = await sql`SELECT id, pushinpay_token FROM sellers WHERE api_key = ${apiKey}`;
         const seller = sellerResult[0];
