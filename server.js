@@ -28,7 +28,7 @@ async function authenticateJwt(req, res, next) {
     });
 }
 
-// --- ROTAS DE AUTENTICAÇÃO ---
+// --- ROTAS DE AUTENTICAÇÃO E CRUD BÁSICO ---
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -39,12 +39,8 @@ app.post('/api/sellers/register', async (req, res) => {
         const apiKey = uuidv4();
         await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${email}, ${hashedPassword}, ${apiKey})`;
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
-    } catch (error) {
-        console.error("Erro no registro:", error);
-        res.status(500).json({ message: 'Erro interno do servidor.' });
-    }
+    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
-
 app.post('/api/sellers/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
@@ -58,13 +54,8 @@ app.post('/api/sellers/login', async (req, res) => {
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
         res.status(200).json({ message: 'Login bem-sucedido!', token, seller: sellerData });
-    } catch (error) {
-        console.error("Erro no login:", error);
-        res.status(500).json({ message: 'Erro interno do servidor.' });
-    }
+    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
-
-// --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -79,22 +70,17 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         const [settingsResult, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
         const settings = settingsResult[0] || { api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, active_pix_provider: 'pushinpay' };
         res.json({ settings, pixels, pressels, bots });
-    } catch (error) { 
-        console.error("Erro ao buscar dados do dashboard:", error);
-        res.status(500).json({ message: 'Erro ao buscar dados.' }); 
-    }
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
 });
-
-// --- ROTAS DE GERENCIAMENTO (CRUD) ---
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     try {
         const newPixel = await sql`INSERT INTO pixel_configurations (seller_id, account_name, pixel_id, meta_api_token) VALUES (${req.user.id}, ${account_name}, ${pixel_id}, ${meta_api_token}) RETURNING *;`;
         res.status(201).json(newPixel[0]);
-    } catch (error) { 
-        if (error.code === '23505') return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' });
-        res.status(500).json({ message: 'Erro ao salvar o pixel.' }); 
+    } catch (error) {
+        if (error.code === '23505') { return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' }); }
+        res.status(500).json({ message: 'Erro ao salvar o pixel.' });
     }
 });
 app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
@@ -106,9 +92,9 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
     try {
         const newBot = await sql`INSERT INTO telegram_bots (seller_id, bot_name, bot_token) VALUES (${req.user.id}, ${bot_name}, ${bot_token}) RETURNING *;`;
         res.status(201).json(newBot[0]);
-    } catch (error) { 
-        if (error.code === '23505') return res.status(409).json({ message: 'Um bot com este nome já existe.' });
-        res.status(500).json({ message: 'Erro ao salvar o bot.' }); 
+    } catch (error) {
+        if (error.code === '23505') { return res.status(409).json({ message: 'Um bot com este nome já existe.' });}
+        res.status(500).json({ message: 'Erro ao salvar o bot.' });
     }
 });
 app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
@@ -118,17 +104,14 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     try {
-        const numeric_bot_id = parseInt(bot_id, 10);
-        const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+        const numeric_bot_id = parseInt(bot_id, 10); const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
         const bot_name = botResult[0].bot_name;
         await sql`BEGIN`;
         try {
             const [newPressel] = await sql`INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
-            for (const pixelId of numeric_pixel_ids) {
-                await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})`;
-            }
+            for (const pixelId of numeric_pixel_ids) { await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})` }
             await sql`COMMIT`;
             res.status(201).json({ ...newPressel, pixel_ids: numeric_pixel_ids });
         } catch (transactionError) { await sql`ROLLBACK`; throw transactionError; }
@@ -198,11 +181,11 @@ app.post('/api/pix/generate', async (req, res) => {
         if (seller.active_pix_provider === 'cnpay') {
             if (!seller.cnpay_public_key || !seller.cnpay_secret_key) return res.status(400).json({ message: 'Credenciais da CN Pay não configuradas.' });
             
-            const commission = (value_cents / 100) * 0.0299;
+            const commission = parseFloat(((value_cents / 100) * 0.0299).toFixed(2));
             const payload = {
                 identifier: uuidv4(),
                 amount: value_cents / 100,
-                client: { name: "Cliente HotTrack", email: "cliente@email.com", document: "123.456.789-00" },
+                client: { name: "Cliente HotTrack", email: "cliente@email.com", document: "123.456.789-00", phone: "11999999999" }, // ## CAMPO 'phone' ADICIONADO ##
                 splits: commission > 0 ? [{ producerId: CNPAY_SPLIT_PRODUCER_ID, amount: commission }] : [],
                 callbackUrl: `https://${req.headers.host}/api/webhook/cnpay`
             };
