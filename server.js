@@ -103,7 +103,7 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
     try {
         const newPixel = await sql`INSERT INTO pixel_configurations (seller_id, account_name, pixel_id, meta_api_token) VALUES (${req.user.id}, ${account_name}, ${pixel_id}, ${meta_api_token}) RETURNING *;`;
         res.status(201).json(newPixel[0]);
-    } catch (error) { 
+    } catch (error) {
         console.error("Erro ao salvar pixel:", error);
         res.status(500).json({ message: 'Erro ao salvar o pixel.' }); 
     }
@@ -117,7 +117,7 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
         res.status(201).json(newBot[0]);
     } catch (error) { 
         console.error("Erro ao salvar bot:", error);
-        if (error.code === '23505') { // Código de violação de unicidade
+        if (error.code === '23505') {
             return res.status(409).json({ message: 'Um bot com este nome já existe.' });
         }
         res.status(500).json({ message: 'Erro ao salvar o bot.' }); 
@@ -126,24 +126,37 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
 
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
-    if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
+    if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) {
+        return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
+    }
     try {
         const numeric_bot_id = parseInt(bot_id, 10);
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
-        if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
-        
+        if (botResult.length === 0) {
+            return res.status(404).json({ message: 'Bot não encontrado.' });
+        }
         const bot_name = botResult[0].bot_name;
+
         let finalPressel = {};
-        await sql.begin(async sql => {
-            const newPresselResult = await sql`INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
+        
+        // CORREÇÃO: Usando sql.transaction em vez de sql.begin
+        await sql.transaction(async (transactionSql) => {
+            const newPresselResult = await transactionSql`
+                INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) 
+                VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) 
+                RETURNING *;`;
+            
             const presselId = newPresselResult[0].id;
+
             for (const pixelId of numeric_pixel_ids) {
-                await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${presselId}, ${pixelId});`;
+                await transactionSql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${presselId}, ${pixelId});`;
             }
             finalPressel = { ...newPresselResult[0], pixel_ids: numeric_pixel_ids };
         });
+
         res.status(201).json(finalPressel);
+
     } catch (error) {
         console.error("Erro detalhado ao salvar pressel:", error);
         res.status(500).json({ message: 'Erro ao salvar a pressel.' });
@@ -159,7 +172,7 @@ app.post('/api/settings/pushinpay', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar o token.' }); }
 });
 
-// ROTA DE RASTREAMENTO
+// --- ROTA DE RASTREAMENTO ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -188,7 +201,7 @@ app.post('/api/registerClick', async (req, res) => {
     }
 });
 
-// ROTAS DE PIX E CONVERSÃO
+// --- ROTAS DE PIX E CONVERSÃO ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
