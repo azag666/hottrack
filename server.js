@@ -109,6 +109,14 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
     }
 });
 
+app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await sql`DELETE FROM pixel_configurations WHERE id = ${id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o pixel.' }); }
+});
+
 app.post('/api/bots', authenticateJwt, async (req, res) => {
     const { bot_name, bot_token } = req.body;
     if(!bot_name || !bot_token) return res.status(400).json({ message: 'Nome e token são obrigatórios.' });
@@ -124,6 +132,14 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
     }
 });
 
+app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await sql`DELETE FROM telegram_bots WHERE id = ${id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
+});
+
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) {
@@ -132,6 +148,7 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     try {
         const numeric_bot_id = parseInt(bot_id, 10);
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
         
@@ -143,14 +160,23 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
 
         if (numeric_pixel_ids.length > 0) {
             const pixelLinks = numeric_pixel_ids.map(pixelId => ({ pressel_id: presselId, pixel_config_id: pixelId }));
-            await sql`INSERT INTO pressel_pixels ${sql(pixelLinks)}`;
+            await sql`INSERT INTO pressel_pixels ${sql(pixelLinks, 'pressel_id', 'pixel_config_id')}`;
         }
+
         const finalPressel = { ...newPressel, pixel_ids: numeric_pixel_ids };
         res.status(201).json(finalPressel);
     } catch (error) {
         console.error("Erro detalhado ao salvar pressel:", error);
         res.status(500).json({ message: 'Erro ao salvar a pressel.' });
     }
+});
+
+app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await sql`DELETE FROM pressels WHERE id = ${id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao excluir a pressel.' }); }
 });
 
 app.post('/api/settings/pushinpay', authenticateJwt, async (req, res) => {
