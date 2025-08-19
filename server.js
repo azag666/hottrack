@@ -105,6 +105,10 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
         res.status(201).json(newPixel[0]);
     } catch (error) { 
         console.error("Erro ao salvar pixel:", error);
+        // Adicionando tratamento para o erro de chave duplicada
+        if (error.code === '23505') {
+            return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' });
+        }
         res.status(500).json({ message: 'Erro ao salvar o pixel.' }); 
     }
 });
@@ -140,6 +144,7 @@ app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
 });
 
+// ## VERSÃO FINAL COM MÉTODO DE INSERÇÃO UNIVERSAL ##
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) {
@@ -162,15 +167,15 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
                 VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url})
                 RETURNING *;
             `;
-
-            const pixelLinks = numeric_pixel_ids.map(pixelId => 
-                sql`(${newPressel.id}, ${pixelId})`
-            );
             
-            await sql`
-                INSERT INTO pressel_pixels (pressel_id, pixel_config_id)
-                VALUES ${sql(pixelLinks)}
-            `;
+            // MÉTODO A PROVA DE FALHAS: Inserir cada pixel associado um por um.
+            // Para a pequena quantidade de pixels por pressel, este método é 100% seguro e a diferença de performance é nula.
+            for (const pixelId of numeric_pixel_ids) {
+                await sql`
+                    INSERT INTO pressel_pixels (pressel_id, pixel_config_id)
+                    VALUES (${newPressel.id}, ${pixelId})
+                `;
+            }
 
             await sql`COMMIT`;
 
