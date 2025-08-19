@@ -41,7 +41,10 @@ app.post('/api/sellers/register', async (req, res) => {
         const apiKey = uuidv4();
         await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${email}, ${hashedPassword}, ${apiKey})`;
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no registro:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
 app.post('/api/sellers/login', async (req, res) => {
@@ -57,7 +60,10 @@ app.post('/api/sellers/login', async (req, res) => {
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
         res.status(200).json({ message: 'Login bem-sucedido!', token, seller: sellerData });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no login:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
 // --- ROTA DE DADOS DO PAINEL ---
@@ -73,7 +79,10 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
             WHERE p.seller_id = ${sellerId} ORDER BY p.created_at DESC`;
         const botsPromise = sql`SELECT * FROM telegram_bots WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
         const [settingsResult, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
-        const settings = settingsResult[0] || { api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, oasyfy_public_key: null, oasyfy_secret_key: null, active_pix_provider: 'pushinpay' };
+        const settings = settingsResult[0] || { 
+            api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, 
+            oasyfy_public_key: null, oasyfy_secret_key: null, active_pix_provider: 'pushinpay' 
+        };
         res.json({ settings, pixels, pressels, bots });
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
 });
@@ -184,6 +193,8 @@ app.post('/api/pix/generate', async (req, res) => {
         const [click] = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${seller.id}`;
         if (!click) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = click.id;
+        
+        let transaction_id, qr_code_text, qr_code_base64;
 
         if (seller.active_pix_provider === 'cnpay' || seller.active_pix_provider === 'oasyfy') {
             const isCnpay = seller.active_pix_provider === 'cnpay';
@@ -197,7 +208,6 @@ app.post('/api/pix/generate', async (req, res) => {
             
             const commission = parseFloat(((value_cents / 100) * 0.0299).toFixed(2));
             let splits = [];
-
             if (apiKey !== ADMIN_API_KEY && commission > 0) {
                 splits.push({ producerId: splitId, amount: commission });
             }
@@ -210,15 +220,15 @@ app.post('/api/pix/generate', async (req, res) => {
                 callbackUrl: `https://${req.headers.host}/api/webhook/${providerName}`
             };
             
-            const response = await axios.post(apiUrl, payload, {
-                headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey }
-            });
+            const response = await axios.post(apiUrl, payload, { headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey } });
 
             const pixData = response.data;
-            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${providerName}, ${pixData.transactionId})`;
-            res.status(200).json({ qr_code_text: pixData.pix.code, qr_code_base64: pixData.pix.base64 });
+            transaction_id = pixData.transactionId;
+            qr_code_text = pixData.pix.code;
+            qr_code_base64 = pixData.pix.base64;
 
-        } else { // Padrão é PushinPay
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${transaction_id}, ${value_cents / 100}, ${qr_code_text}, ${qr_code_base64}, ${providerName}, ${transaction_id})`;
+        } else {
             if (!seller.pushinpay_token) return res.status(400).json({ message: 'Token da PushinPay não configurado.' });
             
             let pushinpaySplitRules = [];
@@ -231,11 +241,19 @@ app.post('/api/pix/generate', async (req, res) => {
                 webhook_url: `https://${req.headers.host}/api/webhook/pushinpay`,
                 split_rules: pushinpaySplitRules
             };
+
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+            
             const pixData = pushinpayResponse.data;
-            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
-            res.status(200).json({ qr_code_text: pixData.qr_code, qr_code_base64: pixData.qr_code_base64 });
+            transaction_id = pixData.id;
+            qr_code_text = pixData.qr_code;
+            qr_code_base64 = pixData.qr_code_base64;
+            
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${transaction_id}, ${value_cents / 100}, ${qr_code_text}, ${qr_code_base64}, 'pushinpay', ${transaction_id})`;
         }
+
+        res.status(200).json({ qr_code_text, qr_code_base64, transaction_id });
+
     } catch (error) {
         console.error("Erro ao gerar PIX:", error.response?.data || error.message);
         res.status(500).json({ message: 'Erro ao gerar cobrança PIX.' });
@@ -243,14 +261,33 @@ app.post('/api/pix/generate', async (req, res) => {
 });
 
 app.post('/api/pix/check-status', async (req, res) => {
-    const { click_id } = req.body;
+    const apiKey = req.headers['x-api-key'];
+    const { click_id, transaction_id } = req.body;
+    if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
+
     try {
-        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
+        const [seller] = await sql`SELECT id FROM sellers WHERE api_key = ${apiKey}`;
+        if (!seller) return res.status(401).json({ message: 'API Key inválida.' });
+
+        let transactions;
+        if (transaction_id) {
+            transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE pt.provider_transaction_id = ${transaction_id} AND c.seller_id = ${seller.id}`;
+        } else {
+            transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id} AND c.seller_id = ${seller.id}`;
+        }
+
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
+        
         const paidTransaction = transactions.find(t => t.status === 'paid');
-        if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
-        return res.status(200).json({ status: 'pending' });
-    } catch (error) { res.status(500).json({ message: 'Erro ao consultar status.' }); }
+        if (paidTransaction) {
+            return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
+        } else {
+            return res.status(200).json({ status: 'pending' });
+        }
+    } catch (error) {
+        console.error("Erro ao consultar status do PIX:", error);
+        res.status(500).json({ message: 'Erro ao consultar status.' });
+    }
 });
 
 // --- WEBHOOKS ---
@@ -293,7 +330,6 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     }
     res.sendStatus(200);
 });
-
 
 async function sendConversionToMeta(clickData, pixData) {
     try {
