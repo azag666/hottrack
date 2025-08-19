@@ -13,7 +13,8 @@ app.use(express.json());
 // --- CONFIGURAÇÃO ---
 const sql = neon(process.env.DATABASE_URL);
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
-const MY_SAAS_SPLIT_ACCOUNT_ID = process.env.MY_SAAS_SPLIT_ACCOUNT_ID;
+const PUSHINPAY_SPLIT_ACCOUNT_ID = process.env.PUSHINPAY_SPLIT_ACCOUNT_ID;
+const CNPAY_SPLIT_PRODUCER_ID = process.env.CNPAY_SPLIT_PRODUCER_ID;
 
 // --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
@@ -38,7 +39,10 @@ app.post('/api/sellers/register', async (req, res) => {
         const apiKey = uuidv4();
         await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${email}, ${hashedPassword}, ${apiKey})`;
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no registro:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
 app.post('/api/sellers/login', async (req, res) => {
@@ -54,18 +58,17 @@ app.post('/api/sellers/login', async (req, res) => {
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
         res.status(200).json({ message: 'Login bem-sucedido!', token, seller: sellerData });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no login:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
-// --- ROTA DE DADOS DO PAINEL (ATUALIZADA) ---
+// --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
-        const settingsPromise = sql`
-            SELECT api_key, pushinpay_token, cnpay_public_key, cnpay_secret_key, active_pix_provider 
-            FROM sellers 
-            WHERE id = ${sellerId}
-        `;
+        const settingsPromise = sql`SELECT api_key, pushinpay_token, cnpay_public_key, cnpay_secret_key, active_pix_provider FROM sellers WHERE id = ${sellerId}`;
         const pixelsPromise = sql`SELECT * FROM pixel_configurations WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
         const presselsPromise = sql`
             SELECT p.*, COALESCE(px.pixel_ids, ARRAY[]::integer[]) as pixel_ids
@@ -73,15 +76,13 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
             LEFT JOIN ( SELECT pressel_id, array_agg(pixel_config_id) as pixel_ids FROM pressel_pixels GROUP BY pressel_id ) px ON p.id = px.pressel_id
             WHERE p.seller_id = ${sellerId} ORDER BY p.created_at DESC`;
         const botsPromise = sql`SELECT * FROM telegram_bots WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
-
         const [settingsResult, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
-        
-        const settings = settingsResult[0] || { 
-            api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, active_pix_provider: 'pushinpay'
-        };
-
+        const settings = settingsResult[0] || { api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, active_pix_provider: 'pushinpay' };
         res.json({ settings, pixels, pressels, bots });
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
+    } catch (error) { 
+        console.error("Erro ao buscar dados do dashboard:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados.' }); 
+    }
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
@@ -91,9 +92,9 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
     try {
         const newPixel = await sql`INSERT INTO pixel_configurations (seller_id, account_name, pixel_id, meta_api_token) VALUES (${req.user.id}, ${account_name}, ${pixel_id}, ${meta_api_token}) RETURNING *;`;
         res.status(201).json(newPixel[0]);
-    } catch (error) {
-        if (error.code === '23505') { return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' }); }
-        res.status(500).json({ message: 'Erro ao salvar o pixel.' });
+    } catch (error) { 
+        if (error.code === '23505') return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' });
+        res.status(500).json({ message: 'Erro ao salvar o pixel.' }); 
     }
 });
 app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
@@ -105,9 +106,9 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
     try {
         const newBot = await sql`INSERT INTO telegram_bots (seller_id, bot_name, bot_token) VALUES (${req.user.id}, ${bot_name}, ${bot_token}) RETURNING *;`;
         res.status(201).json(newBot[0]);
-    } catch (error) {
-        if (error.code === '23505') { return res.status(409).json({ message: 'Um bot com este nome já existe.' });}
-        res.status(500).json({ message: 'Erro ao salvar o bot.' });
+    } catch (error) { 
+        if (error.code === '23505') return res.status(409).json({ message: 'Um bot com este nome já existe.' });
+        res.status(500).json({ message: 'Erro ao salvar o bot.' }); 
     }
 });
 app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
@@ -117,14 +118,17 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     try {
-        const numeric_bot_id = parseInt(bot_id, 10); const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+        const numeric_bot_id = parseInt(bot_id, 10);
+        const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
         const bot_name = botResult[0].bot_name;
         await sql`BEGIN`;
         try {
             const [newPressel] = await sql`INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
-            for (const pixelId of numeric_pixel_ids) { await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})` }
+            for (const pixelId of numeric_pixel_ids) {
+                await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})`;
+            }
             await sql`COMMIT`;
             res.status(201).json({ ...newPressel, pixel_ids: numeric_pixel_ids });
         } catch (transactionError) { await sql`ROLLBACK`; throw transactionError; }
@@ -141,7 +145,7 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
 });
 
-// --- ROTA DE RASTREAMENTO E CONSULTA ---
+// --- ROTA DE RASTREAMENTO E CONSULTAS ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -163,7 +167,6 @@ app.post('/api/registerClick', async (req, res) => {
         res.status(200).json({ status: 'success', click_id: clean_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
-
 app.post('/api/click/info', async (req, res) => {
     const apiKey = req.headers['x-api-key']; const { click_id } = req.body;
     if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
@@ -194,28 +197,34 @@ app.post('/api/pix/generate', async (req, res) => {
 
         if (seller.active_pix_provider === 'cnpay') {
             if (!seller.cnpay_public_key || !seller.cnpay_secret_key) return res.status(400).json({ message: 'Credenciais da CN Pay não configuradas.' });
+            
             const commission = (value_cents / 100) * 0.0299;
             const payload = {
                 identifier: uuidv4(),
                 amount: value_cents / 100,
                 client: { name: "Cliente HotTrack", email: "cliente@email.com", document: "123.456.789-00" },
-                splits: commission > 0 ? [{ producerId: MY_SAAS_SPLIT_ACCOUNT_ID, amount: commission }] : [],
+                splits: commission > 0 ? [{ producerId: CNPAY_SPLIT_PRODUCER_ID, amount: commission }] : [],
                 callbackUrl: `https://${req.headers.host}/api/webhook/cnpay`
             };
+            
             const cnpayResponse = await axios.post('https://painel.appcnpay.com/api/v1/gateway/pix/receive', payload, {
                 headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key }
             });
+
             const pixData = cnpayResponse.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, 'cnpay', ${pixData.transactionId})`;
             res.status(200).json({ qr_code_text: pixData.pix.code, qr_code_base64: pixData.pix.base64 });
-        } else {
+
+        } else { // Padrão é PushinPay
             if (!seller.pushinpay_token) return res.status(400).json({ message: 'Token da PushinPay não configurado.' });
+            
             const commission_cents = Math.floor(value_cents * 0.0299);
             const payload = {
                 value: value_cents,
                 webhook_url: `https://${req.headers.host}/api/webhook/pushinpay`,
-                split_rules: commission_cents > 0 ? [{ value: commission_cents, account_id: MY_SAAS_SPLIT_ACCOUNT_ID }] : []
+                split_rules: commission_cents > 0 ? [{ value: commission_cents, account_id: PUSHINPAY_SPLIT_ACCOUNT_ID }] : []
             };
+
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
             const pixData = pushinpayResponse.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
