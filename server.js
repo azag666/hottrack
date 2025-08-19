@@ -135,6 +135,72 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
 });
 
+// V2.0 START: NOVAS ROTAS PARA GERENCIAMENTO DO FLUXO DO BOT
+app.get('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const sellerId = req.user.id;
+        const result = await sql`
+            SELECT flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text 
+            FROM telegram_bots 
+            WHERE id = ${id} AND seller_id = ${sellerId}`;
+        
+        if (result.length === 0) {
+            return res.status(404).json({ message: 'Bot não encontrado ou não pertence a você.' });
+        }
+        res.json(result[0]);
+    } catch (error) {
+        console.error("Erro ao buscar fluxo: ", error);
+        res.status(500).json({ message: 'Erro ao buscar configuração do fluxo.' });
+    }
+});
+
+app.post('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const sellerId = req.user.id;
+        const { flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text } = req.body;
+
+        await sql`
+            UPDATE telegram_bots 
+            SET 
+                flow_image_url = ${flow_image_url}, 
+                flow_text = ${flow_text},
+                flow_button_pix_text = ${flow_button_pix_text},
+                flow_button_check_text = ${flow_button_check_text}
+            WHERE id = ${id} AND seller_id = ${sellerId}`;
+        
+        res.json({ message: 'Fluxo do bot atualizado com sucesso!' });
+    } catch (error) {
+        console.error("Erro ao salvar fluxo: ", error);
+        res.status(500).json({ message: 'Erro ao salvar a configuração do fluxo.' });
+    }
+});
+
+app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const sellerId = req.user.id;
+        const [bot] = await sql`SELECT bot_token FROM telegram_bots WHERE id = ${id} AND seller_id = ${sellerId}`;
+        
+        if (!bot) {
+            return res.status(404).json({ message: 'Bot não encontrado.' });
+        }
+
+        const vercelUrl = process.env.VERCEL_URL || req.headers.host;
+        const webhookUrl = `https://${vercelUrl}/api/telegram/webhook/${bot.bot_token}`;
+        
+        const telegramApiUrl = `https://api.telegram.org/bot${bot.bot_token}/setWebhook`;
+        await axios.post(telegramApiUrl, { url: webhookUrl });
+
+        res.json({ message: `Bot ativado com sucesso! O Telegram agora enviará as mensagens para o seu sistema.` });
+    } catch (error) {
+        console.error('Erro ao configurar webhook:', error.response?.data || error.message);
+        res.status(500).json({ message: 'Erro ao configurar o webhook. Verifique se o token do bot é válido.' });
+    }
+});
+// V2.0 END: FIM DAS NOVAS ROTAS
+
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
@@ -152,11 +218,12 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
-        const db_click_id = `/start ${clean_click_id}`;
+        const db_click_id = `/start ${clean_click_id}`; // Alterado para corresponder ao formato que o bot vai receber
         await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
         res.status(200).json({ status: 'success', click_id: clean_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
+
 app.post('/api/click/info', async (req, res) => {
     const apiKey = req.headers['x-api-key']; const { click_id } = req.body;
     if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
@@ -181,7 +248,8 @@ app.post('/api/pix/generate', async (req, res) => {
         const [seller] = await sql`SELECT id, active_pix_provider, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key FROM sellers WHERE api_key = ${apiKey}`;
         if (!seller) return res.status(401).json({ message: 'API Key inválida.' });
 
-        const [click] = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${seller.id}`;
+        const full_click_id_db = `/start ${click_id}`;
+        const [click] = await sql`SELECT id FROM clicks WHERE click_id = ${full_click_id_db} AND seller_id = ${seller.id}`;
         if (!click) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = click.id;
 
@@ -207,7 +275,7 @@ app.post('/api/pix/generate', async (req, res) => {
                 amount: value_cents / 100,
                 client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "(27) 99531-0370" },
                 splits: splits,
-                callbackUrl: `https://${req.headers.host}/api/webhook/${providerName}`
+                callbackUrl: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/${providerName}`
             };
             
             const response = await axios.post(apiUrl, payload, {
@@ -228,7 +296,7 @@ app.post('/api/pix/generate', async (req, res) => {
             }
             const payload = {
                 value: value_cents,
-                webhook_url: `https://${req.headers.host}/api/webhook/pushinpay`,
+                webhook_url: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/pushinpay`,
                 split_rules: pushinpaySplitRules
             };
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
@@ -245,7 +313,8 @@ app.post('/api/pix/generate', async (req, res) => {
 app.post('/api/pix/check-status', async (req, res) => {
     const { click_id } = req.body;
     try {
-        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
+        const full_click_id_db = `/start ${click_id}`;
+        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${full_click_id_db}`;
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         const paidTransaction = transactions.find(t => t.status === 'paid');
         if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
@@ -294,6 +363,122 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     res.sendStatus(200);
 });
 
+// V2.0 START: WEBHOOK UNIFICADO PARA RECEBER MENSAGENS DO TELEGRAM
+app.post('/api/telegram/webhook/:token', async (req, res) => {
+    const { token } = req.params;
+    const update = req.body;
+
+    try {
+        const [botConfig] = await sql`
+            SELECT b.*, s.api_key FROM telegram_bots b 
+            JOIN sellers s ON b.seller_id = s.id 
+            WHERE b.bot_token = ${token}`;
+
+        if (!botConfig) {
+            console.warn(`Webhook chamado com token inválido: ${token}`);
+            return res.sendStatus(200);
+        }
+
+        const telegramApi = axios.create({ baseURL: `https://api.telegram.org/bot${token}` });
+
+        // Processa cliques em botões (callback_query)
+        if (update.callback_query) {
+            const { message, data } = update.callback_query;
+            const chatId = message.chat.id;
+            
+            // Tenta extrair o click_id da legenda da imagem
+            const clickIdMatch = message.caption?.match(/start\s+(lead\d+)/);
+            const click_id = clickIdMatch ? clickIdMatch[1] : null;
+
+            if (!click_id) {
+                await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'ID de rastreamento não encontrado. Por favor, inicie novamente pelo link correto.' });
+                return res.sendStatus(200);
+            }
+
+            const sellerApiKey = botConfig.api_key;
+            
+            if (data === 'generate_pix') {
+                 // Este valor deve ser dinâmico. Vindo de um produto, por exemplo.
+                const value_cents = 1000;
+                
+                try {
+                    // Chamada para a própria API de geração de PIX, usando a chave do vendedor dono do bot
+                    const vercelUrl = process.env.VERCEL_URL || req.headers.host;
+                    const pixResponse = await axios.post(`https://${vercelUrl}/api/pix/generate`, 
+                        { click_id, value_cents },
+                        { headers: { 'x-api-key': sellerApiKey } }
+                    );
+                    const { qr_code_base64, qr_code_text } = pixResponse.data;
+                    await telegramApi.post('/sendPhoto', {
+                        chat_id: chatId,
+                        photo: `data:image/png;base64,${qr_code_base64}`,
+                        caption: `✅ PIX Gerado! Copie o código abaixo e pague:\n\n\`${qr_code_text}\``,
+                        parse_mode: 'Markdown'
+                    });
+                } catch (e) {
+                    await telegramApi.post('/sendMessage', { chat_id: chatId, text: `Erro ao gerar seu PIX. Tente novamente.`});
+                    console.error("Erro ao chamar a API /pix/generate via bot", e.response?.data);
+                }
+            } else if (data === 'check_pix') {
+                try {
+                    const vercelUrl = process.env.VERCEL_URL || req.headers.host;
+                    const statusResponse = await axios.post(`https://${vercelUrl}/api/pix/check-status`, 
+                        { click_id }, 
+                        { headers: { 'x-api-key': sellerApiKey } }
+                    );
+                    const { status } = statusResponse.data;
+                    let replyText = 'Aguardando pagamento...';
+                    if (status === 'paid') replyText = '✅ Pagamento confirmado! Obrigado.';
+                    if (status === 'not_found') replyText = 'Nenhuma cobrança PIX encontrada para este ID.';
+
+                    await telegramApi.post('/sendMessage', { chat_id: chatId, text: replyText });
+                } catch(e) {
+                     await telegramApi.post('/sendMessage', { chat_id: chatId, text: `Erro ao consultar o status. Tente novamente.`});
+                     console.error("Erro ao chamar a API /pix/check-status via bot", e.response?.data);
+                }
+            }
+        }
+        
+        // Processa mensagens de texto, como /start
+        else if (update.message && update.message.text) {
+            const { chat, text } = update.message;
+            const chatId = chat.id;
+
+            if (text.startsWith('/start')) {
+                const click_id = text.split(' ')[1] || null;
+
+                if (!botConfig.flow_image_url || !botConfig.flow_text) {
+                     await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Olá! Este bot ainda não foi configurado.' });
+                } else {
+                    const keyboard = {
+                        inline_keyboard: [
+                            [
+                                { text: botConfig.flow_button_pix_text, callback_data: 'generate_pix' },
+                                { text: botConfig.flow_button_check_text, callback_data: 'check_pix' }
+                            ]
+                        ]
+                    };
+                    
+                    const caption = `${botConfig.flow_text}\n\n*ID de Rastreamento:* \`/start ${click_id}\``;
+
+                    await telegramApi.post('/sendPhoto', {
+                        chat_id: chatId,
+                        photo: botConfig.flow_image_url,
+                        caption: caption,
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard
+                    });
+                }
+            }
+        }
+
+    } catch (error) {
+        console.error('Erro no webhook do Telegram:', error);
+    }
+
+    res.sendStatus(200);
+});
+// V2.0 END: FIM DO WEBHOOK
 
 async function sendConversionToMeta(clickData, pixData) {
     try {
