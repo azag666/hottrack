@@ -140,34 +140,51 @@ app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
 });
 
+// ## CORREÇÃO PRINCIPAL APLICADA AQUI ##
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
-    if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) {
-        return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
+    if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) {
+        return res.status(400).json({ message: 'Todos os campos são obrigatórios e ao menos um pixel deve ser selecionado.' });
     }
+
     try {
         const numeric_bot_id = parseInt(bot_id, 10);
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
-        
         const bot_name = botResult[0].bot_name;
-        
-        const newPresselResult = await sql`INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
-        const newPressel = newPresselResult[0];
-        const presselId = newPressel.id;
 
-        if (numeric_pixel_ids.length > 0) {
-            const pixelLinks = numeric_pixel_ids.map(pixelId => ({ pressel_id: presselId, pixel_config_id: pixelId }));
-            await sql`INSERT INTO pressel_pixels ${sql(pixelLinks, 'pressel_id', 'pixel_config_id')}`;
-        }
-        const finalPressel = { ...newPressel, pixel_ids: numeric_pixel_ids };
-        res.status(201).json(finalPressel);
+        // Usando uma transação para garantir a integridade dos dados
+        const result = await sql.begin(async sql => {
+            const [newPressel] = await sql`
+                INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url)
+                VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url})
+                RETURNING *;
+            `;
+
+            if (numeric_pixel_ids.length > 0) {
+                // Mapeia os IDs para o formato que a biblioteca `sql` espera para inserção múltipla
+                const pixelLinks = numeric_pixel_ids.map(pixelId => ({
+                    pressel_id: newPressel.id,
+                    pixel_config_id: pixelId
+                }));
+                
+                // Esta é a forma correta e segura de fazer a inserção múltipla, que corrige o erro de sintaxe
+                await sql`INSERT INTO pressel_pixels ${sql(pixelLinks, 'pressel_id', 'pixel_config_id')}`;
+            }
+            
+            return { ...newPressel, pixel_ids: numeric_pixel_ids };
+        });
+
+        res.status(201).json(result);
     } catch (error) {
+        // Log detalhado do erro no servidor para depuração
         console.error("Erro detalhado ao salvar pressel:", error);
         res.status(500).json({ message: 'Erro ao salvar a pressel.' });
     }
 });
+
 
 app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
     const { id } = req.params;
