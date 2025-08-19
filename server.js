@@ -148,7 +148,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     try {
         const numeric_bot_id = parseInt(bot_id, 10);
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
-
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
         
@@ -162,7 +161,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
             const pixelLinks = numeric_pixel_ids.map(pixelId => ({ pressel_id: presselId, pixel_config_id: pixelId }));
             await sql`INSERT INTO pressel_pixels ${sql(pixelLinks, 'pressel_id', 'pixel_config_id')}`;
         }
-
         const finalPressel = { ...newPressel, pixel_ids: numeric_pixel_ids };
         res.status(201).json(finalPressel);
     } catch (error) {
@@ -188,7 +186,7 @@ app.post('/api/settings/pushinpay', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar o token.' }); }
 });
 
-// --- ROTA DE RASTREAMENTO ---
+// --- ROTA DE RASTREAMENTO (ATUALIZADA) ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -208,9 +206,17 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
 
         const click_record_id = result[0].id;
-        const click_id_string = `click_${click_record_id}_${Date.now()}`;
-        await sql`UPDATE clicks SET click_id = ${click_id_string} WHERE id = ${click_record_id}`;
-        res.status(200).json({ status: 'success', click_id: click_id_string });
+        
+        // --- LÓGICA DO CLICK ID CORRIGIDA ---
+        // 1. Gera o parâmetro limpo para o Telegram (ex: lead000001)
+        const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
+        // 2. Gera a string completa para salvar no banco (ex: /start lead000001)
+        const db_click_id = `/start ${clean_click_id}`;
+        // 3. Salva a string completa no banco de dados
+        await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
+        // 4. Retorna APENAS o parâmetro limpo para a pressel
+        res.status(200).json({ status: 'success', click_id: clean_click_id });
+        
     } catch (error) {
         console.error("Erro ao registrar clique:", error);
         res.status(500).json({ message: 'Erro interno do servidor.' });
