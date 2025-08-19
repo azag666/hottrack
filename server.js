@@ -28,7 +28,6 @@ async function authenticateJwt(req, res, next) {
 }
 
 // --- ROTAS DE AUTENTICAÇÃO E CRUD (EXISTENTES E FUNCIONAIS) ---
-// ... (todas as suas rotas de login, register, pixels, bots, pressels, settings, etc., permanecem aqui, inalteradas)
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -232,13 +231,12 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
 
-        // Consultas para os KPIs agregados
         const kpiQueries = sql`
             WITH seller_clicks AS (
-                SELECT id, pressel_id, state FROM clicks WHERE seller_id = ${sellerId}
+                SELECT id FROM clicks WHERE seller_id = ${sellerId}
             ),
             seller_transactions AS (
-                SELECT pix_t.* FROM pix_transactions pix_t
+                SELECT pix_t.status, pix_t.pix_value FROM pix_transactions pix_t
                 JOIN seller_clicks sc ON pix_t.click_id_internal = sc.id
             )
             SELECT
@@ -248,7 +246,6 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
                 (SELECT SUM(pix_value) FROM seller_transactions WHERE status = 'paid') AS total_revenue
         `;
 
-        // Consulta para o Bot com mais vendas
         const topBotQuery = sql`
             SELECT p.bot_name, COUNT(pt.id) as sales_count
             FROM pix_transactions pt
@@ -260,7 +257,6 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
             LIMIT 1;
         `;
         
-        // Consulta para o Top 10 Estados
         const topStatesQuery = sql`
             SELECT state, COUNT(id) as click_count
             FROM clicks
@@ -270,14 +266,8 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
             LIMIT 10;
         `;
 
-        // Consulta para a lista de transações recentes
         const recentTransactionsQuery = sql`
-            SELECT 
-                pt.pix_value,
-                pt.status,
-                pt.created_at,
-                c.click_id,
-                p.bot_name
+            SELECT pt.pix_value, pt.status, pt.created_at, c.click_id, p.bot_name
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
             JOIN pressels p ON c.pressel_id = p.id
@@ -286,12 +276,11 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
             LIMIT 50;
         `;
         
-        // Executa todas as consultas em paralelo
         const [kpiResult, topBotResult, topStatesResult, recentTransactionsResult] = await Promise.all([
             kpiQueries, topBotQuery, topStatesQuery, recentTransactionsQuery
         ]);
 
-        const kpis = kpiResult[0];
+        const kpis = kpiResult[0] || {};
 
         res.json({
             kpis: {
@@ -299,7 +288,7 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
                 pixGenerated: Number(kpis.pix_generated) || 0,
                 pixPaid: Number(kpis.pix_paid) || 0,
                 totalRevenue: Number(kpis.total_revenue) || 0,
-                conversionRate: kpis.total_clicks > 0 ? (kpis.pix_paid / kpis.total_clicks) * 100 : 0,
+                conversionRate: Number(kpis.total_clicks) > 0 ? (Number(kpis.pix_paid) / Number(kpis.total_clicks)) * 100 : 0,
                 topBot: topBotResult.length > 0 ? topBotResult[0] : { bot_name: 'N/A', sales_count: 0 }
             },
             topStates: topStatesResult,
@@ -317,6 +306,5 @@ app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar dados de análise.' });
     }
 });
-
 
 module.exports = app;
