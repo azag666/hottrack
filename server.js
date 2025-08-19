@@ -103,7 +103,7 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
     try {
         const newPixel = await sql`INSERT INTO pixel_configurations (seller_id, account_name, pixel_id, meta_api_token) VALUES (${req.user.id}, ${account_name}, ${pixel_id}, ${meta_api_token}) RETURNING *;`;
         res.status(201).json(newPixel[0]);
-    } catch (error) {
+    } catch (error) { 
         console.error("Erro ao salvar pixel:", error);
         res.status(500).json({ message: 'Erro ao salvar o pixel.' }); 
     }
@@ -129,32 +129,37 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
     if (!name || !bot_id || !white_page_url || !pixel_ids || pixel_ids.length === 0) {
         return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     }
+    
     try {
         const numeric_bot_id = parseInt(bot_id, 10);
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) {
             return res.status(404).json({ message: 'Bot não encontrado.' });
         }
         const bot_name = botResult[0].bot_name;
 
-        let finalPressel = {};
+        // LÓGICA CORRIGIDA: SEM O BLOCO DE TRANSAÇÃO
+        // Passo 1: Inserir a pressel e obter o ID de volta
+        const newPresselResult = await sql`
+            INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) 
+            VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) 
+            RETURNING *;`;
         
-        // CORREÇÃO: Usando sql.transaction em vez de sql.begin
-        await sql.transaction(async (transactionSql) => {
-            const newPresselResult = await transactionSql`
-                INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) 
-                VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) 
-                RETURNING *;`;
-            
-            const presselId = newPresselResult[0].id;
+        const newPressel = newPresselResult[0];
+        const presselId = newPressel.id;
 
-            for (const pixelId of numeric_pixel_ids) {
-                await transactionSql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${presselId}, ${pixelId});`;
-            }
-            finalPressel = { ...newPresselResult[0], pixel_ids: numeric_pixel_ids };
-        });
+        // Passo 2: Inserir todos os links de pixel de uma só vez
+        if (numeric_pixel_ids.length > 0) {
+            const pixelLinks = numeric_pixel_ids.map(pixelId => ({
+                pressel_id: presselId,
+                pixel_config_id: pixelId
+            }));
+            await sql`INSERT INTO pressel_pixels ${sql(pixelLinks, 'pressel_id', 'pixel_config_id')}`;
+        }
 
+        const finalPressel = { ...newPressel, pixel_ids: numeric_pixel_ids };
         res.status(201).json(finalPressel);
 
     } catch (error) {
@@ -217,7 +222,7 @@ app.post('/api/pix/generate', async (req, res) => {
 
         const COMMISSION_RATE = 0.0499;
         const commission_cents = Math.floor(value_cents * COMMISSION_RATE);
-        const split_rules = [{ value: commission_cents, account_id: MY_PUSHINPAY_ACCOUNT_ID }];
+        const split_rules = commission_cents > 0 ? [{ value: commission_cents, account_id: MY_PUSHINPAY_ACCOUNT_ID }] : [];
         const webhook_url = `https://${req.headers.host}/api/webhook/pushinpay`;
 
         const payload = { value: value_cents, webhook_url, split_rules };
