@@ -105,7 +105,6 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
         res.status(201).json(newPixel[0]);
     } catch (error) { 
         console.error("Erro ao salvar pixel:", error);
-        // Adicionando tratamento para o erro de chave duplicada
         if (error.code === '23505') {
             return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' });
         }
@@ -144,7 +143,6 @@ app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
 });
 
-// ## VERSÃO FINAL COM MÉTODO DE INSERÇÃO UNIVERSAL ##
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) {
@@ -168,8 +166,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
                 RETURNING *;
             `;
             
-            // MÉTODO A PROVA DE FALHAS: Inserir cada pixel associado um por um.
-            // Para a pequena quantidade de pixels por pressel, este método é 100% seguro e a diferença de performance é nula.
             for (const pixelId of numeric_pixel_ids) {
                 await sql`
                     INSERT INTO pressel_pixels (pressel_id, pixel_config_id)
@@ -248,11 +244,13 @@ app.post('/api/pix/generate', async (req, res) => {
         const seller = sellerResult[0];
         if (!seller?.pushinpay_token) return res.status(400).json({ message: 'API PIX não configurada pelo vendedor.' });
 
-        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${'/start ' + click_id}`;
+        // ## CORREÇÃO APLICADA AQUI ##
+        // Remove a adição do prefixo "/start " para buscar o valor exato enviado pelo bot.
+        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = clickResult[0].id;
 
-        const COMMISSION_RATE = 0.0499;
+        const COMMISSION_RATE = 0.0299; // 2.99%
         const commission_cents = Math.floor(value_cents * COMMISSION_RATE);
         const split_rules = commission_cents > 0 ? [{ value: commission_cents, account_id: MY_PUSHINPAY_ACCOUNT_ID }] : [];
         const webhook_url = `https://${req.headers.host}/api/webhook/pushinpay`;
@@ -278,7 +276,7 @@ app.post('/api/pix/check-status', async (req, res) => {
             SELECT pt.status, pt.pix_value 
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
-            WHERE c.click_id = ${'/start ' + click_id}`;
+            WHERE c.click_id = ${click_id}`; // Correção aqui também por consistência
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         
         const paidTransaction = transactions.find(t => t.status === 'paid');
