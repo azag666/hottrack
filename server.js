@@ -234,7 +234,7 @@ app.post('/api/registerClick', async (req, res) => {
     }
 });
 
-// --- ROTAS DE PIX E CONVERSÃO ---
+// --- ROTAS DE PIX E CONSULTA ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
@@ -244,8 +244,6 @@ app.post('/api/pix/generate', async (req, res) => {
         const seller = sellerResult[0];
         if (!seller?.pushinpay_token) return res.status(400).json({ message: 'API PIX não configurada pelo vendedor.' });
 
-        // ## CORREÇÃO APLICADA AQUI ##
-        // Remove a adição do prefixo "/start " para buscar o valor exato enviado pelo bot.
         const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = clickResult[0].id;
@@ -276,7 +274,7 @@ app.post('/api/pix/check-status', async (req, res) => {
             SELECT pt.status, pt.pix_value 
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
-            WHERE c.click_id = ${click_id}`; // Correção aqui também por consistência
+            WHERE c.click_id = ${click_id}`;
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         
         const paidTransaction = transactions.find(t => t.status === 'paid');
@@ -288,6 +286,47 @@ app.post('/api/pix/check-status', async (req, res) => {
     } catch (error) {
         console.error("Erro ao consultar status do PIX:", error);
         res.status(500).json({ message: 'Erro ao consultar status.' });
+    }
+});
+
+// ## NOVA ROTA ADICIONADA AQUI ##
+app.post('/api/click/info', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    const { click_id } = req.body;
+
+    if (!apiKey || !click_id) {
+        return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
+    }
+
+    try {
+        // Primeiro, busca o ID do vendedor pela API Key para garantir segurança
+        const sellerResult = await sql`SELECT id FROM sellers WHERE api_key = ${apiKey}`;
+        if (sellerResult.length === 0) {
+            return res.status(401).json({ message: 'API Key inválida.' });
+        }
+        const seller_id = sellerResult[0].id;
+
+        // Agora, busca as informações do clique para aquele vendedor específico
+        const clickResult = await sql`
+            SELECT city, state
+            FROM clicks
+            WHERE click_id = ${click_id} AND seller_id = ${seller_id}
+        `;
+
+        if (clickResult.length === 0) {
+            return res.status(404).json({ message: 'Click ID não encontrado para este vendedor.' });
+        }
+
+        const clickInfo = clickResult[0];
+        res.status(200).json({
+            status: 'success',
+            city: clickInfo.city,
+            state: clickInfo.state
+        });
+
+    } catch (error) {
+        console.error("Erro ao consultar informações do clique:", error);
+        res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' });
     }
 });
 
