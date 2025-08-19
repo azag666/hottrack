@@ -140,7 +140,6 @@ app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
 });
 
-// ## VERSÃO FINAL E DEFINITIVA DA ROTA ##
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) {
@@ -164,12 +163,10 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
                 RETURNING *;
             `;
 
-            // Mapeia os IDs para uma lista de VALUES a ser inserida
             const pixelLinks = numeric_pixel_ids.map(pixelId => 
                 sql`(${newPressel.id}, ${pixelId})`
             );
             
-            // Constrói e executa a query de inserção múltipla de forma segura
             await sql`
                 INSERT INTO pressel_pixels (pressel_id, pixel_config_id)
                 VALUES ${sql(pixelLinks)}
@@ -188,7 +185,6 @@ app.post('/api/pressels', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao salvar a pressel.' });
     }
 });
-
 
 app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
     const { id } = req.params;
