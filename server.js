@@ -186,7 +186,7 @@ app.post('/api/settings/pushinpay', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar o token.' }); }
 });
 
-// --- ROTA DE RASTREAMENTO (ATUALIZADA) ---
+// --- ROTA DE RASTREAMENTO ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -194,7 +194,7 @@ app.post('/api/registerClick', async (req, res) => {
     const ip_address = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
     let city = 'Desconhecida', state = 'Desconhecido';
     try {
-        if (ip_address && ip_address !== '::1') {
+        if (ip_address && ip_address !== '::1' && !ip_address.startsWith('192.168.')) {
             const geo = await axios.get(`http://ip-api.com/json/${ip_address}?fields=city,regionName`);
             city = geo.data.city || city;
             state = geo.data.regionName || state;
@@ -206,17 +206,10 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
 
         const click_record_id = result[0].id;
-        
-        // --- LÓGICA DO CLICK ID CORRIGIDA ---
-        // 1. Gera o parâmetro limpo para o Telegram (ex: lead000001)
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
-        // 2. Gera a string completa para salvar no banco (ex: /start lead000001)
         const db_click_id = `/start ${clean_click_id}`;
-        // 3. Salva a string completa no banco de dados
         await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
-        // 4. Retorna APENAS o parâmetro limpo para a pressel
         res.status(200).json({ status: 'success', click_id: clean_click_id });
-        
     } catch (error) {
         console.error("Erro ao registrar clique:", error);
         res.status(500).json({ message: 'Erro interno do servidor.' });
@@ -233,7 +226,7 @@ app.post('/api/pix/generate', async (req, res) => {
         const seller = sellerResult[0];
         if (!seller?.pushinpay_token) return res.status(400).json({ message: 'API PIX não configurada pelo vendedor.' });
 
-        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${click_id}`;
+        const clickResult = await sql`SELECT id FROM clicks WHERE click_id = ${'/start ' + click_id}`;
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = clickResult[0].id;
 
@@ -263,7 +256,7 @@ app.post('/api/pix/check-status', async (req, res) => {
             SELECT pt.status, pt.pix_value 
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
-            WHERE c.click_id = ${click_id}`;
+            WHERE c.click_id = ${'/start ' + click_id}`;
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         
         const paidTransaction = transactions.find(t => t.status === 'paid');
@@ -310,12 +303,12 @@ async function sendConversionToMeta(clickData, pixData) {
                         custom_data: { currency: 'BRL', value: pixData.pix_value },
                     }],
                 };
-                await axios.post(`https://graph.facebook.com/v18.0/${pixel_id}/events`, payload, { params: { access_token: meta_api_token } });
+                await axios.post(`https://graph.facebook.com/v19.0/${pixel_id}/events`, payload, { params: { access_token: meta_api_token } });
                 await sql`UPDATE pix_transactions SET meta_event_id = ${event_id} WHERE id = ${pixData.id}`;
             }
         }
     } catch (error) {
-        console.error('Erro ao enviar conversão para a Meta:', error.response?.data || error.message);
+        console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message);
     }
 }
 
