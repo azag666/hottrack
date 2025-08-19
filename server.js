@@ -1,25 +1,3 @@
-Olá\! Analisei as capturas de tela. Você encontrou um bug no servidor ao tentar salvar um Bot. O alerta "Erro ao salvar o bot" e o erro `500` no console confirmam que o problema está no nosso backend (`server.js`).
-
-O erro "500" é genérico. Para consertar o bug, precisamos saber a mensagem exata que o banco de dados está enviando para a API. A única forma de ver isso é através dos logs da Vercel.
-
-### Passo 1: Obter o Log de Erro da Vercel
-
-Por favor, siga estes passos para que possamos descobrir a causa exata do problema:
-
-1.  Vá para o seu projeto da API no site da **Vercel**.
-2.  No menu superior, clique na aba **"Logs"**.
-3.  Com a aba de logs aberta, volte para o seu site (`hottrack.netlify.app`), vá para a página "Gerenciar Bots" e tente salvar um bot novamente para que o erro aconteça em tempo real.
-4.  No Vercel, uma mensagem de erro detalhada em vermelho aparecerá nos logs. Por favor, copie a mensagem de erro completa e me envie. Ela nos dirá exatamente o que está errado.
-
-### Passo 2: Código Corrigido (Solução Provável)
-
-Enquanto você pega os logs, eu revisei o código e encontrei uma causa muito provável. É provável que estejamos tentando inserir dados de uma forma que o banco de dados não está esperando.
-
-Preparei uma versão mais robusta e corrigida de **todo o seu `server.js`**. Esta versão inclui um tratamento de erros melhorado que nos ajudará a identificar problemas futuros e deve resolver o erro atual.
-
-**Por favor, substitua todo o conteúdo do seu `server.js` por este código final:**
-
-```javascript
 const express = require('express');
 const cors = require('cors');
 const { neon } = require('@neondatabase/serverless');
@@ -307,4 +285,3 @@ async function sendConversionToMeta(clickData, pixData) {
 }
 
 module.exports = app;
-```
