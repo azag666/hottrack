@@ -29,7 +29,7 @@ async function authenticateJwt(req, res, next) {
     });
 }
 
-// --- ROTAS DE AUTENTICAÇÃO ---
+// --- ROTAS DE AUTENTICAÇÃO E CRUD BÁSICO ---
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -197,8 +197,8 @@ app.post('/api/pix/generate', async (req, res) => {
             const payload = {
                 identifier: uuidv4(),
                 amount: value_cents / 100,
-                // ## DADOS DO CLIENTE ATUALIZADOS CONFORME SOLICITADO ##
-                client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "5527995310370" },
+                // ## DADOS DO CLIENTE ATUALIZADOS COM FORMATO CORRETO ##
+                client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "(27) 99531-0370" },
                 splits: cnpaySplits,
                 callbackUrl: `https://${req.headers.host}/api/webhook/cnpay`
             };
