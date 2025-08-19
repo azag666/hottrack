@@ -60,7 +60,7 @@ app.post('/api/sellers/login', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
-// --- ROTAS DE DADOS DO PAINEL ---
+// --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -79,59 +79,6 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         };
         res.json({ settings, pixels, pressels, bots });
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
-});
-
-app.get('/api/dashboard/analytics', authenticateJwt, async (req, res) => {
-    try {
-        const sellerId = req.user.id;
-        const kpiQuery = sql`
-            WITH seller_clicks AS (
-                SELECT id FROM clicks WHERE seller_id = ${sellerId}
-            ),
-            seller_transactions AS (
-                SELECT pix_t.status, pix_t.pix_value, pix_t.provider FROM pix_transactions pix_t
-                JOIN seller_clicks sc ON pix_t.click_id_internal = sc.id
-            )
-            SELECT
-                (SELECT COUNT(*) FROM seller_clicks) AS total_clicks,
-                (SELECT COUNT(*) FROM seller_transactions) AS pix_generated,
-                (SELECT COUNT(*) FROM seller_transactions WHERE status = 'paid') AS pix_paid,
-                (SELECT SUM(pix_value) FROM seller_transactions WHERE status = 'paid') AS total_revenue
-        `;
-        const topStatesQuery = sql`
-            SELECT state, COUNT(id) as click_count
-            FROM clicks
-            WHERE seller_id = ${sellerId} AND state IS NOT NULL AND state != 'Desconhecido'
-            GROUP BY state ORDER BY click_count DESC LIMIT 10;
-        `;
-        const providerPerformanceQuery = sql`
-            SELECT provider, COUNT(*) AS generated_count, COUNT(*) FILTER (WHERE status = 'paid') AS paid_count
-            FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id
-            WHERE c.seller_id = ${sellerId} GROUP BY provider;
-        `;
-        const [kpiResult, topStates, providerPerformance] = await Promise.all([ kpiQuery, topStatesQuery, providerPerformanceQuery ]);
-        const kpis = kpiResult[0] || {};
-        const totalClicks = Number(kpis.total_clicks) || 0;
-        const pixPaid = Number(kpis.pix_paid) || 0;
-        res.json({
-            kpis: {
-                totalClicks: totalClicks,
-                pixGenerated: Number(kpis.pix_generated) || 0,
-                pixPaid: pixPaid,
-                totalRevenue: Number(kpis.total_revenue) || 0,
-                conversionRate: totalClicks > 0 ? (pixPaid / totalClicks) * 100 : 0,
-            },
-            topStates: topStates || [],
-            providerPerformance: providerPerformance.map(p => ({
-                provider: p.provider,
-                salesCount: Number(p.paid_count),
-                conversionRate: Number(p.generated_count) > 0 ? (Number(p.paid_count) / Number(p.generated_count)) * 100 : 0
-            })) || []
-        });
-    } catch (error) {
-        console.error("Erro ao buscar dados de análise:", error);
-        res.status(500).json({ message: 'Erro ao buscar dados de análise.' });
-    }
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
