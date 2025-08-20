@@ -72,18 +72,9 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
             LEFT JOIN ( SELECT pressel_id, array_agg(pixel_config_id) as pixel_ids FROM pressel_pixels GROUP BY pressel_id ) px ON p.id = px.pressel_id
             WHERE p.seller_id = ${sellerId} ORDER BY p.created_at DESC`;
         const botsPromise = sql`SELECT * FROM telegram_bots WHERE seller_id = ${sellerId} ORDER BY created_at DESC`;
-        
-        // NOVO: Busca de checkouts
-        const checkoutsPromise = sql`
-            SELECT c.*, COALESCE(px.pixel_ids, ARRAY[]::integer[]) as pixel_ids
-            FROM checkouts c
-            LEFT JOIN ( SELECT checkout_id, array_agg(pixel_config_id) as pixel_ids FROM checkout_pixels GROUP BY checkout_id ) px ON c.id = px.checkout_id
-            WHERE c.seller_id = ${sellerId} ORDER BY c.created_at DESC`;
-            
-        const [settingsResult, pixels, pressels, bots, checkouts] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise, checkoutsPromise]);
-        
+        const [settingsResult, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
         const settings = settingsResult[0] || { api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, oasyfy_public_key: null, oasyfy_secret_key: null, active_pix_provider: 'pushinpay' };
-        res.json({ settings, pixels, pressels, bots, checkouts });
+        res.json({ settings, pixels, pressels, bots });
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
 });
 
@@ -144,25 +135,6 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
 });
 
-// NOVO: ROTAS DE GERENCIAMENTO DE CHECKOUTS
-app.post('/api/checkouts', authenticateJwt, async (req, res) => {
-    const { name, value, template, pix_provider, pixel_ids } = req.body;
-    if (!name || !value || !template || !pix_provider || !Array.isArray(pixel_ids) || pixel_ids.length === 0) return res.status(400).json({ message: 'Dados insuficientes.' });
-    try {
-        const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
-        await sql`BEGIN`;
-        try {
-            const [newCheckout] = await sql`INSERT INTO checkouts (seller_id, name, value, template, pix_provider) VALUES (${req.user.id}, ${name}, ${value}, ${template}, ${pix_provider}) RETURNING *;`;
-            for (const pixelId of numeric_pixel_ids) { await sql`INSERT INTO checkout_pixels (checkout_id, pixel_config_id) VALUES (${newCheckout.id}, ${pixelId})` }
-            await sql`COMMIT`;
-            res.status(201).json({ ...newCheckout, pixel_ids: numeric_pixel_ids });
-        } catch (transactionError) { await sql`ROLLBACK`; throw transactionError; }
-    } catch (error) { res.status(500).json({ message: 'Erro ao salvar o checkout.' }); }
-});
-app.delete('/api/checkouts/:id', authenticateJwt, async (req, res) => {
-    try { await sql`DELETE FROM checkouts WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`; res.status(204).send(); } catch (error) { res.status(500).json({ message: 'Erro ao excluir o checkout.' }); }
-});
-
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
@@ -199,38 +171,133 @@ app.post('/api/click/info', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' }); }
 });
 
-// NOVO: Integração para checkout
+// Nova rota para as métricas do dashboard
+app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
+    try {
+        const sellerId = req.user.id;
+        
+        // Métricas Globais
+        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
+        const totalClicks = totalClicksResult[0].count;
+
+        const totalPixGeneratedResult = await sql`
+            SELECT 
+                COUNT(pt.id) AS total_pix_generated,
+                COALESCE(SUM(pt.pix_value), 0) AS total_revenue
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${sellerId}`;
+        const totalPixGenerated = totalPixGeneratedResult[0].total_pix_generated;
+        const totalRevenue = totalPixGeneratedResult[0].total_revenue;
+
+        const totalPixPaidResult = await sql`
+            SELECT 
+                COUNT(pt.id) AS total_pix_paid,
+                COALESCE(SUM(pt.pix_value), 0) AS paid_revenue
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${sellerId} AND pt.status = 'paid'`;
+        const totalPixPaid = totalPixPaidResult[0].total_pix_paid;
+        const paidRevenue = totalPixPaidResult[0].paid_revenue;
+
+        const conversionRate = totalClicks > 0 ? ((totalPixPaid / totalClicks) * 100).toFixed(2) : 0;
+        
+        // Métricas por Bot
+        const botsPerformance = await sql`
+            SELECT
+                tb.bot_name,
+                COUNT(c.id) AS total_clicks,
+                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS total_pix_paid,
+                COALESCE(SUM(pt.pix_value) FILTER (WHERE pt.status = 'paid'), 0) AS paid_revenue
+            FROM telegram_bots tb
+            LEFT JOIN pressels p ON p.bot_id = tb.id
+            LEFT JOIN clicks c ON c.pressel_id = p.id
+            LEFT JOIN pix_transactions pt ON pt.click_id_internal = c.id
+            WHERE tb.seller_id = ${sellerId}
+            GROUP BY tb.bot_name
+            ORDER BY paid_revenue DESC, total_clicks DESC`;
+        
+        // Métricas de Tráfego por Estado
+        const clicksByState = await sql`
+            SELECT 
+                c.state,
+                COUNT(c.id) AS total_clicks
+            FROM clicks c
+            WHERE c.seller_id = ${sellerId} AND c.state IS NOT NULL
+            GROUP BY c.state
+            ORDER BY total_clicks DESC
+            LIMIT 10`;
+
+        res.status(200).json({
+            total_clicks: parseInt(totalClicks),
+            total_pix_generated: parseInt(totalPixGenerated),
+            total_pix_paid: parseInt(totalPixPaid),
+            conversion_rate: parseFloat(conversionRate),
+            total_revenue: parseFloat(totalRevenue),
+            paid_revenue: parseFloat(paidRevenue),
+            bots_performance: botsPerformance.map(b => ({ ...b, total_clicks: parseInt(b.total_clicks), total_pix_paid: parseInt(b.total_pix_paid), paid_revenue: parseFloat(b.paid_revenue) })),
+            clicks_by_state: clicksByState.map(s => ({ ...s, total_clicks: parseInt(s.total_clicks) }))
+        });
+
+    } catch (error) {
+        console.error("Erro ao buscar métricas do dashboard:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+});
+
+// NOVO ENDPOINT PARA TRANSAÇÕES
+app.get('/api/transactions', authenticateJwt, async (req, res) => {
+    try {
+        const sellerId = req.user.id;
+        const transactions = await sql`
+            SELECT
+                pt.status,
+                pt.pix_value,
+                tb.bot_name,
+                pt.provider,
+                pt.created_at
+            FROM
+                pix_transactions pt
+            JOIN
+                clicks c ON pt.click_id_internal = c.id
+            JOIN
+                pressels p ON c.pressel_id = p.id
+            JOIN
+                telegram_bots tb ON p.bot_id = tb.id
+            WHERE
+                c.seller_id = ${sellerId}
+            ORDER BY
+                pt.created_at DESC;
+        `;
+        res.status(200).json(transactions);
+    } catch (error) {
+        console.error("Erro ao buscar transações:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados das transações.' });
+    }
+});
+
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    const { click_id, value_cents, checkout_id } = req.body;
-    if (!apiKey || !value_cents || !checkout_id) return res.status(400).json({ message: 'API Key, checkout_id e value_cents são obrigatórios.' });
-    
-    let click_id_internal;
-    if (click_id && click_id.startsWith('lead')) {
-        const click_record_id = parseInt(click_id.substring(4), 10);
-        const [click] = await sql`SELECT id FROM clicks WHERE id = ${click_record_id}`;
-        if (!click) return res.status(404).json({ message: 'Click ID não encontrado.' });
-        click_id_internal = click.id;
-    } else {
-         const result = await sql`INSERT INTO clicks (seller_id, pressel_id) SELECT s.id, NULL FROM sellers s WHERE s.api_key = ${apiKey} RETURNING id;`;
-         click_id_internal = result[0].id;
-    }
+    const { click_id, value_cents } = req.body;
+    if (!apiKey || !click_id || !value_cents) return res.status(400).json({ message: 'API Key, click_id e value_cents são obrigatórios.' });
 
     try {
         const [seller] = await sql`SELECT id, active_pix_provider, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key FROM sellers WHERE api_key = ${apiKey}`;
         if (!seller) return res.status(401).json({ message: 'API Key inválida.' });
 
-        const [checkout] = await sql`SELECT pix_provider FROM checkouts WHERE id = ${checkout_id}`;
-        const pix_provider_name = checkout.pix_provider;
+        const [click] = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${seller.id}`;
+        if (!click) return res.status(404).json({ message: 'Click ID não encontrado.' });
+        const click_id_internal = click.id;
 
-        if (pix_provider_name === 'cnpay' || pix_provider_name === 'oasyfy') {
-            const isCnpay = pix_provider_name === 'cnpay';
+        if (seller.active_pix_provider === 'cnpay' || seller.active_pix_provider === 'oasyfy') {
+            const isCnpay = seller.active_pix_provider === 'cnpay';
             const publicKey = isCnpay ? seller.cnpay_public_key : seller.oasyfy_public_key;
             const secretKey = isCnpay ? seller.cnpay_secret_key : seller.oasyfy_secret_key;
             const splitId = isCnpay ? CNPAY_SPLIT_PRODUCER_ID : OASYFY_SPLIT_PRODUCER_ID;
             const apiUrl = isCnpay ? 'https://painel.appcnpay.com/api/v1/gateway/pix/receive' : 'https://app.oasyfy.com/api/v1/gateway/pix/receive';
-            
-            if (!publicKey || !secretKey) return res.status(400).json({ message: `Credenciais da ${pix_provider_name.toUpperCase()} não configuradas.` });
+            const providerName = isCnpay ? 'cnpay' : 'oasyfy';
+
+            if (!publicKey || !secretKey) return res.status(400).json({ message: `Credenciais da ${providerName.toUpperCase()} não configuradas.` });
             
             const commission = parseFloat(((value_cents / 100) * 0.0299).toFixed(2));
             let splits = [];
@@ -244,7 +311,7 @@ app.post('/api/pix/generate', async (req, res) => {
                 amount: value_cents / 100,
                 client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "(27) 99531-0370" },
                 splits: splits,
-                callbackUrl: `https://${req.headers.host}/api/webhook/${pix_provider_name}`
+                callbackUrl: `https://${req.headers.host}/api/webhook/${providerName}`
             };
             
             const response = await axios.post(apiUrl, payload, {
@@ -252,7 +319,7 @@ app.post('/api/pix/generate', async (req, res) => {
             });
 
             const pixData = response.data;
-            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id, checkout_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${pix_provider_name}, ${pixData.transactionId}, ${checkout_id || null})`;
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${providerName}, ${pixData.transactionId})`;
             res.status(200).json({ qr_code_text: pixData.pix.code, qr_code_base64: pixData.pix.base64 });
 
         } else { // Padrão é PushinPay
@@ -270,7 +337,7 @@ app.post('/api/pix/generate', async (req, res) => {
             };
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
             const pixData = pushinpayResponse.data;
-            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id, checkout_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id}, ${checkout_id || null})`;
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
             res.status(200).json({ qr_code_text: pixData.qr_code, qr_code_base64: pixData.qr_code_base64 });
         }
     } catch (error) {
@@ -280,9 +347,9 @@ app.post('/api/pix/generate', async (req, res) => {
 });
 
 app.post('/api/pix/check-status', async (req, res) => {
-    const { checkout_id } = req.body;
+    const { click_id } = req.body;
     try {
-        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt WHERE pt.checkout_id = ${checkout_id}`;
+        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         const paidTransaction = transactions.find(t => t.status === 'paid');
         if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
@@ -335,12 +402,8 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
 async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
-        const checkoutPixels = await sql`SELECT pixel_config_id FROM checkout_pixels WHERE checkout_id = ${pixData.checkout_id}`;
-        const pixels = presselPixels.concat(checkoutPixels);
-
-        if (pixels.length === 0) return;
-        
-        for (const { pixel_config_id } of pixels) {
+        if (presselPixels.length === 0) return;
+        for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
             if (pixelConfig) {
                 const { pixel_id, meta_api_token } = pixelConfig; const event_id = `pix.${pixData.id}.${pixel_id}`;
