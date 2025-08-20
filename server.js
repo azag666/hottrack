@@ -320,7 +320,13 @@ app.post('/api/pix/generate', async (req, res) => {
 
             const pixData = response.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${providerName}, ${pixData.transactionId})`;
-            res.status(200).json({ qr_code_text: pixData.pix.code, qr_code_base64: pixData.pix.base64 });
+            
+            // --- CÓDIGO MODIFICADO AQUI ---
+            res.status(200).json({ 
+                qr_code_text: pixData.pix.code, 
+                qr_code_base64: pixData.pix.base64,
+                transaction_id: pixData.transactionId // Adicionando o ID da transação
+            });
 
         } else { // Padrão é PushinPay
             if (!seller.pushinpay_token) return res.status(400).json({ message: 'Token da PushinPay não configurado.' });
@@ -338,7 +344,13 @@ app.post('/api/pix/generate', async (req, res) => {
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
             const pixData = pushinpayResponse.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
-            res.status(200).json({ qr_code_text: pixData.qr_code, qr_code_base64: pixData.qr_code_base64 });
+            
+            // --- CÓDIGO MODIFICADO AQUI ---
+            res.status(200).json({ 
+                qr_code_text: pixData.qr_code, 
+                qr_code_base64: pixData.qr_code_base64,
+                transaction_id: pixData.id // Adicionando o ID da transação
+            });
         }
     } catch (error) {
         console.error("Erro ao gerar PIX:", error.response?.data || error.message);
