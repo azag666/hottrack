@@ -186,7 +186,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
         }
         
         // Métricas Globais
-        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks ${dateFilter}`;
+        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks c ${dateFilter}`;
         const totalClicks = totalClicksResult[0].count;
 
         const totalPixGeneratedResult = await sql`
@@ -254,10 +254,20 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     }
 });
 
-// Rota para buscar todas as transações de um vendedor
+// Rota para buscar todas as transações de um vendedor com filtro de data
 app.get('/api/transactions', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
+        const { startDate, endDate } = req.query;
+
+        let dateFilter = sql`WHERE c.seller_id = ${sellerId}`;
+        if (startDate && endDate) {
+            dateFilter = sql`
+                WHERE c.seller_id = ${sellerId}
+                AND pt.created_at >= ${new Date(startDate)}
+                AND pt.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1))}`;
+        }
+
         const transactions = await sql`
             SELECT
                 pt.pix_id,
@@ -270,7 +280,7 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
             JOIN clicks c ON pt.click_id_internal = c.id
             LEFT JOIN pressels p ON c.pressel_id = p.id
             LEFT JOIN telegram_bots tb ON p.bot_id = tb.id
-            WHERE c.seller_id = ${sellerId}
+            ${dateFilter}
             ORDER BY pt.created_at DESC;
         `;
         res.status(200).json(transactions);
