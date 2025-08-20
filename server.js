@@ -181,8 +181,8 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
         if (startDate && endDate) {
             dateFilter = sql`
                 WHERE c.seller_id = ${sellerId}
-                AND c.created_at >= ${new Date(startDate)}
-                AND c.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1))}`;
+                AND c.created_at >= ${new Date(startDate).toISOString()}
+                AND c.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1)).toISOString()}`;
         }
         
         // Métricas Globais
@@ -264,8 +264,8 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
         if (startDate && endDate) {
             dateFilter = sql`
                 WHERE c.seller_id = ${sellerId}
-                AND pt.created_at >= ${new Date(startDate)}
-                AND pt.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1))}`;
+                AND pt.created_at >= ${new Date(startDate).toISOString()}
+                AND pt.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1)).toISOString()}`;
         }
 
         const transactions = await sql`
