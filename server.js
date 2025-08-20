@@ -175,37 +175,83 @@ app.post('/api/click/info', async (req, res) => {
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
+        
+        // Métricas Globais
         const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
         const totalClicks = totalClicksResult[0].count;
+
         const totalPixGeneratedResult = await sql`
             SELECT COUNT(pt.id)
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
             WHERE c.seller_id = ${sellerId}`;
         const totalPixGenerated = totalPixGeneratedResult[0].count;
+
         const totalPixPaidResult = await sql`
             SELECT COUNT(pt.id)
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
             WHERE c.seller_id = ${sellerId} AND pt.status = 'paid'`;
         const totalPixPaid = totalPixPaidResult[0].count;
-        const conversionRate = totalClicks > 0
-            ? ((totalPixPaid / totalClicks) * 100).toFixed(2)
-            : 0;
+
+        const conversionRate = totalClicks > 0 ? ((totalPixPaid / totalClicks) * 100).toFixed(2) : 0;
+        const pixConversionRate = totalPixGenerated > 0 ? ((totalPixPaid / totalPixGenerated) * 100).toFixed(2) : 0;
+        
+        // Métricas por Bot e Pressel
+        const botsPerformance = await sql`
+            SELECT
+                tb.bot_name,
+                COUNT(c.id) AS total_clicks,
+                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS total_pix_paid
+            FROM telegram_bots tb
+            LEFT JOIN pressels p ON p.bot_id = tb.id
+            LEFT JOIN clicks c ON c.pressel_id = p.id
+            LEFT JOIN pix_transactions pt ON pt.click_id_internal = c.id
+            WHERE tb.seller_id = ${sellerId}
+            GROUP BY tb.bot_name
+            ORDER BY total_pix_paid DESC, total_clicks DESC`;
+
+        const presselsPerformance = await sql`
+            SELECT
+                p.name AS pressel_name,
+                COUNT(c.id) AS total_clicks,
+                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS total_pix_paid
+            FROM pressels p
+            LEFT JOIN clicks c ON c.pressel_id = p.id
+            LEFT JOIN pix_transactions pt ON pt.click_id_internal = c.id
+            WHERE p.seller_id = ${sellerId}
+            GROUP BY p.name
+            ORDER BY total_pix_paid DESC, total_clicks DESC`;
+
+        // Métricas por Localização
+        const salesByState = await sql`
+            SELECT 
+                c.state,
+                COUNT(pt.id) AS total_pix_paid
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${sellerId} AND pt.status = 'paid' AND c.state IS NOT NULL
+            GROUP BY c.state
+            ORDER BY total_pix_paid DESC
+            LIMIT 10`;
+
         res.status(200).json({
             total_clicks: parseInt(totalClicks),
             total_pix_generated: parseInt(totalPixGenerated),
             total_pix_paid: parseInt(totalPixPaid),
-            conversion_rate: parseFloat(conversionRate)
+            conversion_rate: parseFloat(conversionRate),
+            pix_conversion_rate: parseFloat(pixConversionRate),
+            bots_performance: botsPerformance.map(b => ({ ...b, total_clicks: parseInt(b.total_clicks), total_pix_paid: parseInt(b.total_pix_paid) })),
+            pressels_performance: presselsPerformance.map(p => ({ ...p, total_clicks: parseInt(p.total_clicks), total_pix_paid: parseInt(p.total_pix_paid) })),
+            sales_by_state: salesByState.map(s => ({ ...s, total_pix_paid: parseInt(s.total_pix_paid) }))
         });
+
     } catch (error) {
         console.error("Erro ao buscar métricas do dashboard:", error);
         res.status(500).json({ message: 'Erro interno do servidor.' });
     }
 });
 
-
-// --- ROTAS DE PIX (COM LÓGICA DE MÚLTIPLOS PROVEDORES) ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
