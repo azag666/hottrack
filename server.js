@@ -202,7 +202,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
 
         const conversionRate = totalClicks > 0 ? ((totalPixPaid / totalClicks) * 100).toFixed(2) : 0;
         
-        // Métricas por Bot e Pressel
+        // Métricas por Bot
         const botsPerformance = await sql`
             SELECT
                 tb.bot_name,
@@ -216,20 +216,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             WHERE tb.seller_id = ${sellerId}
             GROUP BY tb.bot_name
             ORDER BY paid_revenue DESC, total_clicks DESC`;
-
-        const presselsPerformance = await sql`
-            SELECT
-                p.name AS pressel_name,
-                COUNT(c.id) AS total_clicks,
-                COUNT(pt.id) FILTER (WHERE pt.status = 'paid') AS total_pix_paid,
-                COALESCE(SUM(pt.pix_value) FILTER (WHERE pt.status = 'paid'), 0) AS paid_revenue
-            FROM pressels p
-            LEFT JOIN clicks c ON c.pressel_id = p.id
-            LEFT JOIN pix_transactions pt ON pt.click_id_internal = c.id
-            WHERE p.seller_id = ${sellerId}
-            GROUP BY p.name
-            ORDER BY paid_revenue DESC, total_clicks DESC`;
-
+        
         // Métricas de Tráfego por Estado
         const clicksByState = await sql`
             SELECT 
@@ -249,7 +236,6 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             total_revenue: parseFloat(totalRevenue),
             paid_revenue: parseFloat(paidRevenue),
             bots_performance: botsPerformance.map(b => ({ ...b, total_clicks: parseInt(b.total_clicks), total_pix_paid: parseInt(b.total_pix_paid), paid_revenue: parseFloat(b.paid_revenue) })),
-            pressels_performance: presselsPerformance.map(p => ({ ...p, total_clicks: parseInt(p.total_clicks), total_pix_paid: parseInt(p.total_pix_paid), paid_revenue: parseFloat(p.paid_revenue) })),
             clicks_by_state: clicksByState.map(s => ({ ...s, total_clicks: parseInt(s.total_clicks) }))
         });
 
