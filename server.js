@@ -454,23 +454,26 @@ async function checkPendingTransactions() {
                     console.error(`Seller não encontrado para a transação ${tx.id}. Pulando.`);
                     continue;
                 }
-
+                
+                // --- LOGS ADICIONADOS AQUI ---
+                console.log(`Verificando transação ID: ${tx.id} do provedor: ${tx.provider}`);
+                console.log(`ID da transação no provedor: ${tx.provider_transaction_id}`);
+                
                 let providerStatus;
                 if (tx.provider === 'pushinpay') {
-                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'cnpay') {
-                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'oasyfy') {
-                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.oasyfy_public_key, 'x-secret-key': seller.oasyfy_secret_key } });
                     providerStatus = response.data.status;
                 }
 
-                if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
+                console.log(`Status retornado pelo provedor ${tx.provider}: ${providerStatus}`);
+                
+                if (providerStatus === 'paid' || providerStatus === 'PAID' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
                         SET status = 'paid', paid_at = NOW()
@@ -485,7 +488,7 @@ async function checkPendingTransactions() {
                     }
                 }
             } catch (error) {
-                console.error(`Erro ao verificar transação ${tx.id}:`, error.response?.data || error.message);
+                console.error(`Erro ao verificar transação ${tx.id} no provedor ${tx.provider}:`, error.response?.data || error.message);
             }
         }
     } catch (error) {
