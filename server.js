@@ -457,13 +457,15 @@ async function checkPendingTransactions() {
 
                 let providerStatus;
                 if (tx.provider === 'pushinpay') {
-                    // --- LINHA CORRIGIDA AQUI ---
+                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'cnpay') {
+                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'oasyfy') {
+                    // --- CORREÇÃO APLICADA AQUI ---
                     const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.oasyfy_public_key, 'x-secret-key': seller.oasyfy_secret_key } });
                     providerStatus = response.data.status;
                 }
@@ -494,6 +496,6 @@ async function checkPendingTransactions() {
 }
 
 // Inicia a rotina de verificação a cada 10 minutos (600000 ms)
-setInterval(checkPendingTransactions, 300000);
+setInterval(checkPendingTransactions, 600000);
 
 module.exports = app;
