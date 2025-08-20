@@ -148,7 +148,7 @@ app.post('/api/registerClick', async (req, res) => {
         }
     } catch (e) { console.error("Erro ao buscar geolocalização"); }
     try {
-        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, city, state, fbclid, fbp, fbc) SELECT s.id, ${presselId}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbc} FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
+        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, city, state, fbclid, fbp, fbc) SELECT s.id, ${presselId}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbp}, ${fbc} FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
@@ -369,36 +369,15 @@ app.post('/api/pix/check-status', async (req, res) => {
 
 // --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
-    console.log('Webhook da PushinPay recebido. Corpo da requisição:', req.body);
     const { id, status } = req.body;
-
     if (status === 'paid') {
         try {
-            console.log(`Tentando atualizar transação com ID do provedor: ${id}`);
-            const [updatedTx] = await sql`
-                UPDATE pix_transactions
-                SET status = 'paid', paid_at = NOW()
-                WHERE provider_transaction_id = ${id} AND provider = 'pushinpay' AND status != 'paid'
-                RETURNING *
-            `;
-            
+            const [updatedTx] = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE provider_transaction_id = ${id} AND provider = 'pushinpay' AND status != 'paid' RETURNING *`;
             if (updatedTx) {
-                console.log(`Transação ${updatedTx.id} atualizada com sucesso pelo webhook.`);
                 const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
-                if(click) {
-                    await sendConversionToMeta(click, updatedTx);
-                    console.log(`Evento de conversão enviado para a Meta para a transação ${updatedTx.id}.`);
-                } else {
-                    console.error(`Erro: Click não encontrado para a transação ${updatedTx.id}.`);
-                }
-            } else {
-                console.warn(`Aviso: Transação com ID ${id} não foi atualizada. Ela pode já ter sido marcada como 'paid' ou o ID não foi encontrado.`);
+                if(click) await sendConversionToMeta(click, updatedTx);
             }
-        } catch (error) {
-            console.error("Erro no processamento do webhook da PushinPay:", error.message);
-        }
-    } else {
-        console.log(`Webhook recebido para o ID ${id}, mas o status não é 'paid'. Status recebido: ${status}`);
+        } catch (error) { console.error("Erro no webhook da PushinPay:", error); }
     }
     res.sendStatus(200);
 });
@@ -498,11 +477,11 @@ async function checkPendingTransactions() {
                 }
 
                 if (!providerStatus) {
-                    console.warn(`Aviso: A API do provedor ${tx.provider} não retornou um status para a transação ${tx.id}. Resposta completa:`, response.data);
+                    console.warn(`A API do provedor ${tx.provider} não retornou um status para a transação ${tx.id}. Resposta completa:`, response.data);
                     continue; // Pula para a próxima transação se não houver status na resposta
                 }
                 
-                if (providerStatus.toLowerCase() === 'paid' || providerStatus === 'COMPLETED') {
+                if (providerStatus === 'paid' || providerStatus === 'PAID' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
                         SET status = 'paid', paid_at = NOW()
@@ -512,10 +491,7 @@ async function checkPendingTransactions() {
                     
                     if (updatedTx) {
                         const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
-                        if(click) {
-                            await sendConversionToMeta(click, updatedTx);
-                            console.log(`Evento de conversão enviado para a Meta para a transação ${updatedTx.id}.`);
-                        }
+                        if(click) await sendConversionToMeta(click, updatedTx);
                         console.log(`Transação ${tx.id} atualizada para 'paid' pela rotina de verificação.`);
                     }
                 }
