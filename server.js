@@ -175,18 +175,9 @@ app.post('/api/click/info', async (req, res) => {
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
-        const { startDate, endDate } = req.query;
-
-        let dateFilter = sql`WHERE c.seller_id = ${sellerId}`;
-        if (startDate && endDate) {
-            dateFilter = sql`
-                WHERE c.seller_id = ${sellerId}
-                AND c.created_at >= ${new Date(startDate).toISOString()}
-                AND c.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1)).toISOString()}`;
-        }
         
         // Métricas Globais
-        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks c ${dateFilter}`;
+        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
         const totalClicks = totalClicksResult[0].count;
 
         const totalPixGeneratedResult = await sql`
@@ -195,7 +186,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
                 COALESCE(SUM(pt.pix_value), 0) AS total_revenue
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
-            ${dateFilter}`;
+            WHERE c.seller_id = ${sellerId}`;
         const totalPixGenerated = totalPixGeneratedResult[0].total_pix_generated;
         const totalRevenue = totalPixGeneratedResult[0].total_revenue;
 
@@ -205,7 +196,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
                 COALESCE(SUM(pt.pix_value), 0) AS paid_revenue
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
-            ${dateFilter} AND pt.status = 'paid'`;
+            WHERE c.seller_id = ${sellerId} AND pt.status = 'paid'`;
         const totalPixPaid = totalPixPaidResult[0].total_pix_paid;
         const paidRevenue = totalPixPaidResult[0].paid_revenue;
 
@@ -222,7 +213,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             LEFT JOIN pressels p ON p.bot_id = tb.id
             LEFT JOIN clicks c ON c.pressel_id = p.id
             LEFT JOIN pix_transactions pt ON pt.click_id_internal = c.id
-            ${dateFilter}
+            WHERE tb.seller_id = ${sellerId}
             GROUP BY tb.bot_name
             ORDER BY paid_revenue DESC, total_clicks DESC`;
         
@@ -232,7 +223,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
                 c.state,
                 COUNT(c.id) AS total_clicks
             FROM clicks c
-            ${dateFilter} AND c.state IS NOT NULL
+            WHERE c.seller_id = ${sellerId} AND c.state IS NOT NULL
             GROUP BY c.state
             ORDER BY total_clicks DESC
             LIMIT 10`;
@@ -253,43 +244,6 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro interno do servidor.' });
     }
 });
-
-// Rota para buscar todas as transações de um vendedor com filtro de data
-app.get('/api/transactions', authenticateJwt, async (req, res) => {
-    try {
-        const sellerId = req.user.id;
-        const { startDate, endDate } = req.query;
-
-        let dateFilter = sql`WHERE c.seller_id = ${sellerId}`;
-        if (startDate && endDate) {
-            dateFilter = sql`
-                WHERE c.seller_id = ${sellerId}
-                AND pt.created_at >= ${new Date(startDate).toISOString()}
-                AND pt.created_at < ${new Date(new Date(endDate).setDate(new Date(endDate).getDate() + 1)).toISOString()}`;
-        }
-
-        const transactions = await sql`
-            SELECT
-                pt.pix_id,
-                pt.pix_value,
-                pt.status,
-                pt.created_at,
-                c.click_id,
-                tb.bot_name
-            FROM pix_transactions pt
-            JOIN clicks c ON pt.click_id_internal = c.id
-            LEFT JOIN pressels p ON c.pressel_id = p.id
-            LEFT JOIN telegram_bots tb ON p.bot_id = tb.id
-            ${dateFilter}
-            ORDER BY pt.created_at DESC;
-        `;
-        res.status(200).json(transactions);
-    } catch (error) {
-        console.error("Erro ao buscar transações:", error);
-        res.status(500).json({ message: 'Erro ao buscar transações.' });
-    }
-});
-
 
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
