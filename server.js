@@ -153,8 +153,7 @@ app.post('/api/registerClick', async (req, res) => {
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
         
-        // --- CÓDIGO CORRIGIDO AQUI ---
-        // A consulta agora salva o ID limpo que o ManyChat envia
+        // --- CÓDIGO CORRIGIDO AQUI: Salva o ID limpo no banco de dados ---
         await sql`UPDATE clicks SET click_id = ${clean_click_id} WHERE id = ${click_record_id}`;
         
         res.status(200).json({ status: 'success', click_id: clean_click_id });
@@ -510,7 +509,6 @@ async function checkPendingTransactions() {
                     continue;
                 }
                 
-                // Mapeamento de status para garantir que 'paid' ou 'PAID' funcionem.
                 if (providerStatus.toLowerCase() === 'paid' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
