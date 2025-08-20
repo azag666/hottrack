@@ -5,7 +5,6 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
-const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -31,7 +30,7 @@ async function authenticateJwt(req, res, next) {
     });
 }
 
-// --- ROTAS DE AUTENTICAÇÃO E DASHBOARD ---
+// --- ROTAS DE AUTENTICAÇÃO ---
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -61,6 +60,7 @@ app.post('/api/sellers/login', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
+// --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -135,67 +135,6 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
 });
 
-// ROTA DE GERENCIAMENTO DE FLUXO ATUALIZADA
-app.get('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const sellerId = req.user.id;
-        const result = await sql`
-            SELECT flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text, flow_pix_value_cents
-            FROM telegram_bots 
-            WHERE id = ${id} AND seller_id = ${sellerId}`;
-        
-        if (result.length === 0) {
-            return res.status(404).json({ message: 'Bot não encontrado ou não pertence a você.' });
-        }
-        res.json(result[0]);
-    } catch (error) {
-        res.status(500).json({ message: 'Erro ao buscar configuração do fluxo.' });
-    }
-});
-
-app.post('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const sellerId = req.user.id;
-        const { flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text, flow_pix_value_cents } = req.body;
-
-        await sql`
-            UPDATE telegram_bots 
-            SET 
-                flow_image_url = ${flow_image_url}, 
-                flow_text = ${flow_text},
-                flow_button_pix_text = ${flow_button_pix_text},
-                flow_button_check_text = ${flow_button_check_text},
-                flow_pix_value_cents = ${flow_pix_value_cents}
-            WHERE id = ${id} AND seller_id = ${sellerId}`;
-        
-        res.json({ message: 'Fluxo do bot atualizado com sucesso!' });
-    } catch (error) {
-        res.status(500).json({ message: 'Erro ao salvar a configuração do fluxo.' });
-    }
-});
-
-app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const sellerId = req.user.id;
-        const [bot] = await sql`SELECT bot_token FROM telegram_bots WHERE id = ${id} AND seller_id = ${sellerId}`;
-        
-        if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
-
-        const vercelUrl = process.env.VERCEL_URL || req.headers.host;
-        const webhookUrl = `https://${vercelUrl}/api/telegram/webhook/${bot.bot_token}`;
-        
-        const telegramApiUrl = `https://api.telegram.org/bot${bot.bot_token}/setWebhook`;
-        await axios.post(telegramApiUrl, { url: webhookUrl });
-
-        res.json({ message: `Bot ativado com sucesso! O Telegram agora enviará as mensagens para o seu sistema.` });
-    } catch (error) {
-        res.status(500).json({ message: 'Erro ao configurar o webhook. Verifique se o token do bot é válido.' });
-    }
-});
-
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
@@ -213,11 +152,11 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
-        await sql`UPDATE clicks SET click_id = ${clean_click_id} WHERE id = ${click_record_id}`;
+        const db_click_id = `/start ${clean_click_id}`;
+        await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
         res.status(200).json({ status: 'success', click_id: clean_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
-
 app.post('/api/click/info', async (req, res) => {
     const apiKey = req.headers['x-api-key']; const { click_id } = req.body;
     if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
@@ -232,6 +171,7 @@ app.post('/api/click/info', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' }); }
 });
 
+// --- ROTAS DE PIX (COM LÓGICA DE MÚLTIPLOS PROVEDORES) ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
@@ -240,7 +180,7 @@ app.post('/api/pix/generate', async (req, res) => {
     try {
         const [seller] = await sql`SELECT id, active_pix_provider, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key FROM sellers WHERE api_key = ${apiKey}`;
         if (!seller) return res.status(401).json({ message: 'API Key inválida.' });
-        
+
         const [click] = await sql`SELECT id FROM clicks WHERE click_id = ${click_id} AND seller_id = ${seller.id}`;
         if (!click) return res.status(404).json({ message: 'Click ID não encontrado.' });
         const click_id_internal = click.id;
@@ -251,7 +191,7 @@ app.post('/api/pix/generate', async (req, res) => {
             const secretKey = isCnpay ? seller.cnpay_secret_key : seller.oasyfy_secret_key;
             const splitId = isCnpay ? CNPAY_SPLIT_PRODUCER_ID : OASYFY_SPLIT_PRODUCER_ID;
             const apiUrl = isCnpay ? 'https://painel.appcnpay.com/api/v1/gateway/pix/receive' : 'https://app.oasyfy.com/api/v1/gateway/pix/receive';
-            const providerName = isCnpay ? 'cnpay' : 'oasyfy'; // <<< LINHA CORRIGIDA
+            const providerName = isCnpay ? 'cnpay' : 'oasyfy';
 
             if (!publicKey || !secretKey) return res.status(400).json({ message: `Credenciais da ${providerName.toUpperCase()} não configuradas.` });
             
@@ -267,7 +207,7 @@ app.post('/api/pix/generate', async (req, res) => {
                 amount: value_cents / 100,
                 client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "(27) 99531-0370" },
                 splits: splits,
-                callbackUrl: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/${providerName}`
+                callbackUrl: `https://${req.headers.host}/api/webhook/${providerName}`
             };
             
             const response = await axios.post(apiUrl, payload, {
@@ -288,7 +228,7 @@ app.post('/api/pix/generate', async (req, res) => {
             }
             const payload = {
                 value: value_cents,
-                webhook_url: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/pushinpay`,
+                webhook_url: `https://${req.headers.host}/api/webhook/pushinpay`,
                 split_rules: pushinpaySplitRules
             };
             const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
@@ -313,142 +253,7 @@ app.post('/api/pix/check-status', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao consultar status.' }); }
 });
 
-// --- WEBHOOK DE TELEGRAM ---
-app.post('/api/telegram/webhook/:token', async (req, res) => {
-    const { token } = req.params;
-    const update = req.body;
-    
-    console.log(`[LOG] Webhook recebido para token: ...${token.slice(-5)}`, JSON.stringify(update));
-
-    try {
-        const [botConfig] = await sql`
-            SELECT b.*, s.api_key FROM telegram_bots b 
-            JOIN sellers s ON b.seller_id = s.id 
-            WHERE b.bot_token = ${token}`;
-
-        if (!botConfig) {
-            console.error(`[ERRO] Bot não encontrado no DB para o token: ...${token.slice(-5)}`);
-            return res.sendStatus(200);
-        }
-
-        const telegramApi = axios.create({ baseURL: `https://api.telegram.org/bot${token}` });
-
-        if (update.callback_query) {
-            const { message, data, from } = update.callback_query;
-            const chatId = message.chat.id;
-            console.log(`[LOG] Callback Query recebido: '${data}' do usuário ${from.id}`);
-
-            const clickIdMatch = message.caption?.match(/ID de Rastreamento:\s*`?(lead\d+)`?/);
-            const click_id = clickIdMatch ? clickIdMatch[1] : null;
-
-            if (!click_id) {
-                console.error(`[ERRO] Não foi possível extrair o click_id da legenda para o chat ${chatId}`);
-                await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Erro: ID de rastreamento não encontrado. Por favor, inicie novamente pelo link correto.' });
-                return res.sendStatus(200);
-            }
-            console.log(`[LOG] Click ID extraído: ${click_id}`);
-
-            const sellerApiKey = botConfig.api_key;
-            
-            if (data === 'generate_pix') {
-                const value_cents = botConfig.flow_pix_value_cents;
-                if (!value_cents || value_cents <= 0) {
-                     console.error(`[ERRO] Valor do PIX não configurado ou inválido para o bot ${botConfig.id}`);
-                     await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Erro: O valor do PIX para este produto não foi configurado corretamente.'});
-                     return res.sendStatus(200);
-                }
-
-                try {
-                    const vercelUrl = process.env.VERCEL_URL || req.headers.host;
-                    console.log(`[LOG] Gerando PIX para ${click_id} no valor de ${value_cents} centavos.`);
-                    const pixResponse = await axios.post(`https://${vercelUrl}/api/pix/generate`, 
-                        { click_id, value_cents },
-                        { headers: { 'x-api-key': sellerApiKey } }
-                    );
-                    const { qr_code_base64, qr_code_text } = pixResponse.data;
-                    await telegramApi.post('/sendPhoto', {
-                        chat_id: chatId,
-                        photo: `data:image/png;base64,${qr_code_base64}`,
-                        caption: `✅ PIX Gerado! Copie o código abaixo e pague:\n\n\`${qr_code_text}\``,
-                        parse_mode: 'Markdown'
-                    });
-                } catch (e) {
-                    console.error("[ERRO] Falha ao chamar a API /pix/generate:", e.response?.data || e.message);
-                    await telegramApi.post('/sendMessage', { chat_id: chatId, text: `Ops! Ocorreu um erro ao gerar seu PIX. Tente novamente.`});
-                }
-
-            } else if (data === 'check_pix') {
-                try {
-                     const vercelUrl = process.env.VERCEL_URL || req.headers.host;
-                     console.log(`[LOG] Verificando status do PIX para ${click_id}.`);
-                     const statusResponse = await axios.post(`https://${vercelUrl}/api/pix/check-status`, { click_id });
-                     const { status } = statusResponse.data;
-                     let replyText = 'Aguardando pagamento...';
-                     if (status === 'paid') replyText = '✅ Pagamento confirmado! Obrigado.';
-                     if (status === 'not_found') replyText = 'Nenhuma cobrança PIX encontrada para este ID.';
-                     await telegramApi.post('/sendMessage', { chat_id: chatId, text: replyText });
-                } catch(e) {
-                     console.error("[ERRO] Falha ao chamar a API /pix/check-status:", e.response?.data || e.message);
-                     await telegramApi.post('/sendMessage', { chat_id: chatId, text: `Erro ao consultar o status. Tente novamente.`});
-                }
-            }
-        }
-        
-        else if (update.message && update.message.text) {
-            const { chat, text, from } = update.message;
-            const chatId = chat.id;
-
-            if (text.startsWith('/start')) {
-                const click_id = text.split(' ')[1] || null;
-                console.log(`[LOG] Comando /start recebido do usuário ${from.id} com click_id: ${click_id}`);
-
-                if (!click_id) {
-                    console.warn(`[AVISO] Comando /start sem click_id para o chat ${chatId}`);
-                    await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Olá! Para usar este bot, por favor, acesse através do link de uma de nossas ofertas.' });
-                    return res.sendStatus(200);
-                }
-
-                if (!botConfig.flow_image_url || !botConfig.flow_text) {
-                    console.warn(`[AVISO] Fluxo não configurado para o bot ${botConfig.id}`);
-                    await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Olá! Este bot ainda não foi configurado.' });
-                } else {
-                    const keyboard = {
-                        inline_keyboard: [
-                            [
-                                { text: botConfig.flow_button_pix_text, callback_data: 'generate_pix' },
-                                { text: botConfig.flow_button_check_text, callback_data: 'check_pix' }
-                            ]
-                        ]
-                    };
-                    
-                    const caption = `${botConfig.flow_text}\n\nID de Rastreamento: \`${click_id}\``;
-                    
-                    try {
-                        console.log(`[LOG] Enviando mensagem de fluxo para o chat ${chatId}`);
-                        await telegramApi.post('/sendPhoto', {
-                            chat_id: chatId,
-                            photo: botConfig.flow_image_url,
-                            caption: caption,
-                            parse_mode: 'Markdown',
-                            reply_markup: keyboard
-                        });
-                        console.log(`[LOG] Mensagem de fluxo enviada com sucesso.`);
-                    } catch (e) {
-                        console.error(`[ERRO] Falha ao enviar a foto do fluxo:`, e.response?.data || e.message);
-                         await telegramApi.post('/sendMessage', { chat_id: chatId, text: 'Ocorreu um erro ao carregar o conteúdo. Verifique se a URL da imagem no painel é válida.' });
-                    }
-                }
-            }
-        }
-
-    } catch (error) {
-        console.error('[ERRO FATAL] Erro não tratado no webhook do Telegram:', error);
-    }
-
-    res.sendStatus(200);
-});
-
-// --- WEBHOOKS DE PAGAMENTO e sendConversionToMeta ---
+// --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
     const { id, status } = req.body;
     if (status === 'paid') {
@@ -489,6 +294,7 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     res.sendStatus(200);
 });
 
+
 async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
@@ -504,14 +310,5 @@ async function sendConversionToMeta(clickData, pixData) {
         }
     } catch (error) { console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message); }
 }
-
-// ROTA PARA SERVIR O FRONTEND
-app.get('*', (req, res) => {
-    if (!req.path.startsWith('/api/')) {
-        res.sendFile(path.resolve(__dirname, 'index.html'));
-    } else {
-        res.status(404).json({ message: 'Endpoint não encontrado.' });
-    }
-});
 
 module.exports = app;
