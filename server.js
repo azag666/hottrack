@@ -493,6 +493,6 @@ async function checkPendingTransactions() {
 }
 
 // Inicia a rotina de verificação a cada 10 minutos (600000 ms)
-setInterval(checkPendingTransactions, 600000);
+setInterval(checkPendingTransactions, 300000);
 
 module.exports = app;
