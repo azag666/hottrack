@@ -455,9 +455,11 @@ async function checkPendingTransactions() {
                     continue;
                 }
                 
-                // --- LOGS ADICIONADOS AQUI ---
+                // --- LOGS ADICIONADOS AQUI PARA VERIFICAÇÃO ---
                 console.log(`Verificando transação ID: ${tx.id} do provedor: ${tx.provider}`);
                 console.log(`ID da transação no provedor: ${tx.provider_transaction_id}`);
+                console.log(`Token PushinPay: ${seller.pushinpay_token}`);
+                console.log(`Chaves CNPay: Public=${seller.cnpay_public_key}, Secret=${seller.cnpay_secret_key}`);
                 
                 let providerStatus;
                 if (tx.provider === 'pushinpay') {
@@ -473,7 +475,7 @@ async function checkPendingTransactions() {
 
                 console.log(`Status retornado pelo provedor ${tx.provider}: ${providerStatus}`);
                 
-                if (providerStatus === 'paid' || providerStatus === 'PAID' || providerStatus === 'COMPLETED') {
+                if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
                         SET status = 'paid', paid_at = NOW()
