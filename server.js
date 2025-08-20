@@ -146,13 +146,13 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
 
 // NOVO: ROTAS DE GERENCIAMENTO DE CHECKOUTS
 app.post('/api/checkouts', authenticateJwt, async (req, res) => {
-    const { name, value, template, pix_provider, pixel_ids, custom_options } = req.body;
+    const { name, value, template, pix_provider, pixel_ids } = req.body;
     if (!name || !value || !template || !pix_provider || !Array.isArray(pixel_ids) || pixel_ids.length === 0) return res.status(400).json({ message: 'Dados insuficientes.' });
     try {
         const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
         await sql`BEGIN`;
         try {
-            const [newCheckout] = await sql`INSERT INTO checkouts (seller_id, name, value, template, pix_provider, custom_options) VALUES (${req.user.id}, ${name}, ${value}, ${template}, ${pix_provider}, ${JSON.stringify(custom_options)}) RETURNING *;`;
+            const [newCheckout] = await sql`INSERT INTO checkouts (seller_id, name, value, template, pix_provider) VALUES (${req.user.id}, ${name}, ${value}, ${template}, ${pix_provider}) RETURNING *;`;
             for (const pixelId of numeric_pixel_ids) { await sql`INSERT INTO checkout_pixels (checkout_id, pixel_config_id) VALUES (${newCheckout.id}, ${pixelId})` }
             await sql`COMMIT`;
             res.status(201).json({ ...newCheckout, pixel_ids: numeric_pixel_ids });
@@ -203,7 +203,7 @@ app.post('/api/click/info', async (req, res) => {
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents, checkout_id } = req.body;
-    if (!apiKey || !value_cents) return res.status(400).json({ message: 'API Key e value_cents são obrigatórios.' });
+    if (!apiKey || !value_cents || !checkout_id) return res.status(400).json({ message: 'API Key, checkout_id e value_cents são obrigatórios.' });
     
     let click_id_internal;
     if (click_id && click_id.startsWith('lead')) {
@@ -220,14 +220,8 @@ app.post('/api/pix/generate', async (req, res) => {
         const [seller] = await sql`SELECT id, active_pix_provider, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key FROM sellers WHERE api_key = ${apiKey}`;
         if (!seller) return res.status(401).json({ message: 'API Key inválida.' });
 
-        // NOVO: O provedor de PIX pode ser o padrão do vendedor ou um específico do checkout
-        let pix_provider_name;
-        if (checkout_id) {
-            const [checkout] = await sql`SELECT pix_provider FROM checkouts WHERE id = ${checkout_id}`;
-            pix_provider_name = checkout.pix_provider;
-        } else {
-            pix_provider_name = seller.active_pix_provider;
-        }
+        const [checkout] = await sql`SELECT pix_provider FROM checkouts WHERE id = ${checkout_id}`;
+        const pix_provider_name = checkout.pix_provider;
 
         if (pix_provider_name === 'cnpay' || pix_provider_name === 'oasyfy') {
             const isCnpay = pix_provider_name === 'cnpay';
@@ -286,9 +280,9 @@ app.post('/api/pix/generate', async (req, res) => {
 });
 
 app.post('/api/pix/check-status', async (req, res) => {
-    const { click_id } = req.body;
+    const { checkout_id } = req.body;
     try {
-        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
+        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt WHERE pt.checkout_id = ${checkout_id}`;
         if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         const paidTransaction = transactions.find(t => t.status === 'paid');
         if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
