@@ -171,6 +171,40 @@ app.post('/api/click/info', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' }); }
 });
 
+// Nova rota para as métricas do dashboard
+app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
+    try {
+        const sellerId = req.user.id;
+        const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
+        const totalClicks = totalClicksResult[0].count;
+        const totalPixGeneratedResult = await sql`
+            SELECT COUNT(pt.id)
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${sellerId}`;
+        const totalPixGenerated = totalPixGeneratedResult[0].count;
+        const totalPixPaidResult = await sql`
+            SELECT COUNT(pt.id)
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            WHERE c.seller_id = ${sellerId} AND pt.status = 'paid'`;
+        const totalPixPaid = totalPixPaidResult[0].count;
+        const conversionRate = totalClicks > 0
+            ? ((totalPixPaid / totalClicks) * 100).toFixed(2)
+            : 0;
+        res.status(200).json({
+            total_clicks: parseInt(totalClicks),
+            total_pix_generated: parseInt(totalPixGenerated),
+            total_pix_paid: parseInt(totalPixPaid),
+            conversion_rate: parseFloat(conversionRate)
+        });
+    } catch (error) {
+        console.error("Erro ao buscar métricas do dashboard:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+});
+
+
 // --- ROTAS DE PIX (COM LÓGICA DE MÚLTIPLOS PROVEDORES) ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
