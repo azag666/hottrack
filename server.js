@@ -153,10 +153,12 @@ app.post('/api/registerClick', async (req, res) => {
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
         
-        // --- CÓDIGO CORRIGIDO AQUI: Salva o ID limpo no banco de dados ---
-        await sql`UPDATE clicks SET click_id = ${clean_click_id} WHERE id = ${click_record_id}`;
+        // --- CÓDIGO CORRIGIDO AQUI ---
+        // A consulta agora salva o ID com o prefixo "/start " para manter a consistência
+        const db_click_id = `/start ${clean_click_id}`;
+        await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
         
-        res.status(200).json({ status: 'success', click_id: clean_click_id });
+        res.status(200).json({ status: 'success', click_id: db_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
 
