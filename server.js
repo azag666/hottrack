@@ -455,27 +455,33 @@ async function checkPendingTransactions() {
                     continue;
                 }
                 
-                // --- LOGS ADICIONADOS AQUI PARA VERIFICAÇÃO ---
-                console.log(`Verificando transação ID: ${tx.id} do provedor: ${tx.provider}`);
-                console.log(`ID da transação no provedor: ${tx.provider_transaction_id}`);
-                console.log(`Token PushinPay: ${seller.pushinpay_token}`);
-                console.log(`Chaves CNPay: Public=${seller.cnpay_public_key}, Secret=${seller.cnpay_secret_key}`);
-                
                 let providerStatus;
-                if (tx.provider === 'pushinpay') {
-                    const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
-                    providerStatus = response.data.status;
-                } else if (tx.provider === 'cnpay') {
-                    const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
-                    providerStatus = response.data.status;
-                } else if (tx.provider === 'oasyfy') {
-                    const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.oasyfy_public_key, 'x-secret-key': seller.oasyfy_secret_key } });
-                    providerStatus = response.data.status;
+                let response; // Variável para armazenar a resposta da API
+                let isCNPayOrOasyfy = (tx.provider === 'cnpay' || tx.provider === 'oasyfy');
+
+                try {
+                    if (tx.provider === 'pushinpay') {
+                        response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+                        providerStatus = response.data.status;
+                    } else if (isCNPayOrOasyfy) {
+                        const apiUrl = tx.provider === 'cnpay' ? 'https://painel.appcnpay.com/api/v1/gateway/pix/receive' : 'https://app.oasyfy.com/api/v1/gateway/pix/receive';
+                        const publicKey = tx.provider === 'cnpay' ? seller.cnpay_public_key : seller.oasyfy_public_key;
+                        const secretKey = tx.provider === 'cnpay' ? seller.cnpay_secret_key : seller.oasyfy_secret_key;
+                        
+                        response = await axios.get(`${apiUrl}/${tx.provider_transaction_id}`, { headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey } });
+                        providerStatus = response.data.status;
+                    }
+                } catch (error) {
+                    console.error(`Erro na requisição para o provedor ${tx.provider} (ID: ${tx.id}):`, error.response?.data || error.message);
+                    continue; // Pula para a próxima transação em caso de erro na requisição
                 }
 
-                console.log(`Status retornado pelo provedor ${tx.provider}: ${providerStatus}`);
+                if (!providerStatus) {
+                    console.warn(`A API do provedor ${tx.provider} não retornou um status para a transação ${tx.id}. Resposta completa:`, response.data);
+                    continue; // Pula para a próxima transação se não houver status na resposta
+                }
                 
-                if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
+                if (providerStatus === 'paid' || providerStatus === 'PAID' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
                         SET status = 'paid', paid_at = NOW()
@@ -501,6 +507,6 @@ async function checkPendingTransactions() {
 }
 
 // Inicia a rotina de verificação a cada 10 minutos (600000 ms)
-setInterval(checkPendingTransactions, 600000);
+setInterval(checkPendingTransactions, 200000);
 
 module.exports = app;
