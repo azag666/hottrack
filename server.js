@@ -321,11 +321,10 @@ app.post('/api/pix/generate', async (req, res) => {
             const pixData = response.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${providerName}, ${pixData.transactionId})`;
             
-            // --- CÓDIGO MODIFICADO AQUI ---
             res.status(200).json({ 
                 qr_code_text: pixData.pix.code, 
                 qr_code_base64: pixData.pix.base64,
-                transaction_id: pixData.transactionId // Adicionando o ID da transação
+                transaction_id: pixData.transactionId
             });
 
         } else { // Padrão é PushinPay
@@ -345,11 +344,10 @@ app.post('/api/pix/generate', async (req, res) => {
             const pixData = pushinpayResponse.data;
             await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
             
-            // --- CÓDIGO MODIFICADO AQUI ---
             res.status(200).json({ 
                 qr_code_text: pixData.qr_code, 
                 qr_code_base64: pixData.qr_code_base64,
-                transaction_id: pixData.id // Adicionando o ID da transação
+                transaction_id: pixData.id
             });
         }
     } catch (error) {
@@ -426,5 +424,76 @@ async function sendConversionToMeta(clickData, pixData) {
         }
     } catch (error) { console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message); }
 }
+
+// --- FUNÇÃO DE CONSULTA PERIÓDICA ---
+async function checkPendingTransactions() {
+    console.log('Iniciando verificação de transações pendentes...');
+    try {
+        const pendingTransactions = await sql`
+            SELECT id, provider, provider_transaction_id, click_id_internal
+            FROM pix_transactions
+            WHERE status = 'pending' AND created_at > NOW() - INTERVAL '24 hours'
+        `;
+
+        if (pendingTransactions.length === 0) {
+            console.log('Nenhuma transação pendente para verificar. Encerrando.');
+            return;
+        }
+
+        console.log(`Encontradas ${pendingTransactions.length} transações pendentes. Iniciando consultas.`);
+
+        for (const tx of pendingTransactions) {
+            try {
+                // Tenta buscar o token ou chaves do vendedor
+                const [seller] = await sql`
+                    SELECT pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key
+                    FROM sellers s
+                    JOIN clicks c ON c.seller_id = s.id
+                    WHERE c.id = ${tx.click_id_internal}
+                `;
+                if (!seller) {
+                    console.error(`Seller não encontrado para a transação ${tx.id}. Pulando.`);
+                    continue;
+                }
+
+                let providerStatus;
+                if (tx.provider === 'pushinpay') {
+                    const response = await axios.get(`https://api.pushinpay.com.br/api/pix/cashIn/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+                    providerStatus = response.data.status;
+                } else if (tx.provider === 'cnpay') {
+                    const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
+                    providerStatus = response.data.status;
+                } else if (tx.provider === 'oasyfy') {
+                    const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.oasyfy_public_key, 'x-secret-key': seller.oasyfy_secret_key } });
+                    providerStatus = response.data.status;
+                }
+
+                if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
+                    const [updatedTx] = await sql`
+                        UPDATE pix_transactions
+                        SET status = 'paid', paid_at = NOW()
+                        WHERE id = ${tx.id} AND status != 'paid'
+                        RETURNING *
+                    `;
+                    
+                    if (updatedTx) {
+                        const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
+                        if(click) await sendConversionToMeta(click, updatedTx);
+                        console.log(`Transação ${tx.id} atualizada para 'paid' pela rotina de verificação.`);
+                    }
+                }
+            } catch (error) {
+                console.error(`Erro ao verificar transação ${tx.id}:`, error.response?.data || error.message);
+            }
+        }
+    } catch (error) {
+        console.error("Erro na rotina de verificação geral:", error.message);
+    } finally {
+        console.log('Verificação de transações concluída.');
+    }
+}
+
+// Inicia a rotina de verificação a cada 10 minutos (600000 ms)
+setInterval(checkPendingTransactions, 300000);
 
 module.exports = app;
