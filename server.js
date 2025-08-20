@@ -444,7 +444,6 @@ async function checkPendingTransactions() {
 
         for (const tx of pendingTransactions) {
             try {
-                // Tenta buscar o token ou chaves do vendedor
                 const [seller] = await sql`
                     SELECT pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key
                     FROM sellers s
@@ -494,6 +493,6 @@ async function checkPendingTransactions() {
 }
 
 // Inicia a rotina de verificação a cada 10 minutos (600000 ms)
-setInterval(checkPendingTransactions, 300000);
+setInterval(checkPendingTransactions, 600000);
 
 module.exports = app;
