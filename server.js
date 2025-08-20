@@ -152,11 +152,15 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
-        const db_click_id = `/start ${clean_click_id}`;
-        await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
+        
+        // --- CÓDIGO CORRIGIDO AQUI ---
+        // A consulta agora salva o ID limpo que o ManyChat envia
+        await sql`UPDATE clicks SET click_id = ${clean_click_id} WHERE id = ${click_record_id}`;
+        
         res.status(200).json({ status: 'success', click_id: clean_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
+
 app.post('/api/click/info', async (req, res) => {
     const apiKey = req.headers['x-api-key']; const { click_id } = req.body;
     if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
@@ -369,15 +373,36 @@ app.post('/api/pix/check-status', async (req, res) => {
 
 // --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
+    console.log('Webhook da PushinPay recebido. Corpo da requisição:', req.body);
     const { id, status } = req.body;
+
     if (status === 'paid') {
         try {
-            const [updatedTx] = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE provider_transaction_id = ${id} AND provider = 'pushinpay' AND status != 'paid' RETURNING *`;
+            console.log(`Tentando atualizar transação com ID do provedor: ${id}`);
+            const [updatedTx] = await sql`
+                UPDATE pix_transactions
+                SET status = 'paid', paid_at = NOW()
+                WHERE provider_transaction_id = ${id} AND provider = 'pushinpay' AND status != 'paid'
+                RETURNING *
+            `;
+            
             if (updatedTx) {
+                console.log(`Transação ${updatedTx.id} atualizada com sucesso pelo webhook.`);
                 const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
-                if(click) await sendConversionToMeta(click, updatedTx);
+                if(click) {
+                    await sendConversionToMeta(click, updatedTx);
+                    console.log(`Evento de conversão enviado para a Meta para a transação ${updatedTx.id}.`);
+                } else {
+                    console.error(`Erro: Click não encontrado para a transação ${updatedTx.id}.`);
+                }
+            } else {
+                console.warn(`Aviso: Transação com ID ${id} não foi atualizada. Ela pode já ter sido marcada como 'paid' ou o ID não foi encontrado.`);
             }
-        } catch (error) { console.error("Erro no webhook da PushinPay:", error); }
+        } catch (error) {
+            console.error("Erro no processamento do webhook da PushinPay:", error.message);
+        }
+    } else {
+        console.log(`Webhook recebido para o ID ${id}, mas o status não é 'paid'. Status recebido: ${status}`);
     }
     res.sendStatus(200);
 });
@@ -455,27 +480,38 @@ async function checkPendingTransactions() {
                     continue;
                 }
                 
-                // --- LOGS ADICIONADOS AQUI PARA VERIFICAÇÃO ---
-                console.log(`Verificando transação ID: ${tx.id} do provedor: ${tx.provider}`);
-                console.log(`ID da transação no provedor: ${tx.provider_transaction_id}`);
-                console.log(`Token PushinPay: ${seller.pushinpay_token}`);
-                console.log(`Chaves CNPay: Public=${seller.cnpay_public_key}, Secret=${seller.cnpay_secret_key}`);
-                
                 let providerStatus;
-                if (tx.provider === 'pushinpay') {
-                    const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
-                    providerStatus = response.data.status;
-                } else if (tx.provider === 'cnpay') {
-                    const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
-                    providerStatus = response.data.status;
-                } else if (tx.provider === 'oasyfy') {
-                    const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.oasyfy_public_key, 'x-secret-key': seller.oasyfy_secret_key } });
-                    providerStatus = response.data.status;
+                let response;
+
+                try {
+                    if (tx.provider === 'pushinpay') {
+                        response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+                        providerStatus = response.data.status;
+                    } else if (tx.provider === 'cnpay') {
+                        const publicKey = seller.cnpay_public_key;
+                        const secretKey = seller.cnpay_secret_key;
+                        
+                        response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey } });
+                        providerStatus = response.data.status;
+                    } else if (tx.provider === 'oasyfy') {
+                        const publicKey = seller.oasyfy_public_key;
+                        const secretKey = seller.oasyfy_secret_key;
+                        
+                        response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey } });
+                        providerStatus = response.data.status;
+                    }
+                } catch (error) {
+                    console.error(`Erro na requisição para o provedor ${tx.provider} (ID: ${tx.id}):`, error.response?.data || error.message);
+                    continue;
                 }
 
-                console.log(`Status retornado pelo provedor ${tx.provider}: ${providerStatus}`);
+                if (!providerStatus) {
+                    console.warn(`Aviso: A API do provedor ${tx.provider} não retornou um status para a transação ${tx.id}. Resposta completa:`, response.data);
+                    continue;
+                }
                 
-                if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
+                // Mapeamento de status para garantir que 'paid' ou 'PAID' funcionem.
+                if (providerStatus.toLowerCase() === 'paid' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
                         UPDATE pix_transactions
                         SET status = 'paid', paid_at = NOW()
@@ -485,7 +521,10 @@ async function checkPendingTransactions() {
                     
                     if (updatedTx) {
                         const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
-                        if(click) await sendConversionToMeta(click, updatedTx);
+                        if(click) {
+                            await sendConversionToMeta(click, updatedTx);
+                            console.log(`Evento de conversão enviado para a Meta para a transação ${updatedTx.id}.`);
+                        }
                         console.log(`Transação ${tx.id} atualizada para 'paid' pela rotina de verificação.`);
                     }
                 }
