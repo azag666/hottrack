@@ -5,7 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
-const path = require('path'); // Adicionado para servir o index.html
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -32,7 +32,6 @@ async function authenticateJwt(req, res, next) {
 }
 
 // --- ROTAS DE AUTENTICAÇÃO E DASHBOARD ---
-// (Suas rotas de login, register e dashboard/data continuam as mesmas)
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
@@ -80,7 +79,6 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
-// (Suas rotas de CRUD de pixels, bots, pressels e settings continuam as mesmas)
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
@@ -137,13 +135,11 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
 });
 
-
 // ROTA DE GERENCIAMENTO DE FLUXO ATUALIZADA
 app.get('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
     try {
         const { id } = req.params;
         const sellerId = req.user.id;
-        // ATUALIZADO: Busca também o valor do PIX
         const result = await sql`
             SELECT flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text, flow_pix_value_cents
             FROM telegram_bots 
@@ -162,7 +158,6 @@ app.post('/api/bots/:id/flow', authenticateJwt, async (req, res) => {
     try {
         const { id } = req.params;
         const sellerId = req.user.id;
-        // ATUALIZADO: Recebe também o valor do PIX
         const { flow_image_url, flow_text, flow_button_pix_text, flow_button_check_text, flow_pix_value_cents } = req.body;
 
         await sql`
@@ -201,9 +196,7 @@ app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
     }
 });
 
-
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
-// (Suas rotas de registerClick, click/info, pix/generate, pix/check-status e webhooks de pagamento continuam as mesmas)
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -220,7 +213,6 @@ app.post('/api/registerClick', async (req, res) => {
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
-        // Armazena no DB o ID limpo, que é o que o Telegram usa como payload do /start
         await sql`UPDATE clicks SET click_id = ${clean_click_id} WHERE id = ${click_record_id}`;
         res.status(200).json({ status: 'success', click_id: clean_click_id });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
@@ -259,12 +251,73 @@ app.post('/api/pix/generate', async (req, res) => {
             const secretKey = isCnpay ? seller.cnpay_secret_key : seller.oasyfy_secret_key;
             const splitId = isCnpay ? CNPAY_SPLIT_PRODUCER_ID : OASYFY_SPLIT_PRODUCER_ID;
             const apiUrl = isCnpay ? 'https://painel.appcnpay.com/api/v1/gateway/pix/receive' : 'https://app.oasyfy.com/api/v1/gateway/pix/receive';
-            const providerName = isCnpay ? 'cnpay' WEBHOOK DE TELEGRAM ATUALIZADO E À PROVA DE BUGS
+            const providerName = isCnpay ? 'cnpay' : 'oasyfy'; // <<< LINHA CORRIGIDA
+
+            if (!publicKey || !secretKey) return res.status(400).json({ message: `Credenciais da ${providerName.toUpperCase()} não configuradas.` });
+            
+            const commission = parseFloat(((value_cents / 100) * 0.0299).toFixed(2));
+            let splits = [];
+
+            if (apiKey !== ADMIN_API_KEY && commission > 0) {
+                splits.push({ producerId: splitId, amount: commission });
+            }
+
+            const payload = {
+                identifier: uuidv4(),
+                amount: value_cents / 100,
+                client: { name: "Cliente", email: "cliente@email.com", document: "21376710773", phone: "(27) 99531-0370" },
+                splits: splits,
+                callbackUrl: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/${providerName}`
+            };
+            
+            const response = await axios.post(apiUrl, payload, {
+                headers: { 'x-public-key': publicKey, 'x-secret-key': secretKey }
+            });
+
+            const pixData = response.data;
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.transactionId}, ${value_cents / 100}, ${pixData.pix.code}, ${pixData.pix.base64}, ${providerName}, ${pixData.transactionId})`;
+            res.status(200).json({ qr_code_text: pixData.pix.code, qr_code_base64: pixData.pix.base64 });
+
+        } else { // Padrão é PushinPay
+            if (!seller.pushinpay_token) return res.status(400).json({ message: 'Token da PushinPay não configurado.' });
+            
+            let pushinpaySplitRules = [];
+            const commission_cents = Math.floor(value_cents * 0.0299);
+            if (apiKey !== ADMIN_API_KEY && commission_cents > 0) {
+                pushinpaySplitRules.push({ value: commission_cents, account_id: PUSHINPAY_SPLIT_ACCOUNT_ID });
+            }
+            const payload = {
+                value: value_cents,
+                webhook_url: `https://${process.env.VERCEL_URL || req.headers.host}/api/webhook/pushinpay`,
+                split_rules: pushinpaySplitRules
+            };
+            const pushinpayResponse = await axios.post('https://api.pushinpay.com.br/api/pix/cashIn', payload, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+            const pixData = pushinpayResponse.data;
+            await sql`INSERT INTO pix_transactions (click_id_internal, pix_id, pix_value, qr_code_text, qr_code_base64, provider, provider_transaction_id) VALUES (${click_id_internal}, ${pixData.id}, ${value_cents / 100}, ${pixData.qr_code}, ${pixData.qr_code_base64}, 'pushinpay', ${pixData.id})`;
+            res.status(200).json({ qr_code_text: pixData.qr_code, qr_code_base64: pixData.qr_code_base64 });
+        }
+    } catch (error) {
+        console.error("Erro ao gerar PIX:", error.response?.data || error.message);
+        res.status(500).json({ message: 'Erro ao gerar cobrança PIX.' });
+    }
+});
+
+app.post('/api/pix/check-status', async (req, res) => {
+    const { click_id } = req.body;
+    try {
+        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
+        if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
+        const paidTransaction = transactions.find(t => t.status === 'paid');
+        if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
+        return res.status(200).json({ status: 'pending' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao consultar status.' }); }
+});
+
+// --- WEBHOOK DE TELEGRAM ---
 app.post('/api/telegram/webhook/:token', async (req, res) => {
     const { token } = req.params;
     const update = req.body;
     
-    // Log de cada requisição recebida para depuração
     console.log(`[LOG] Webhook recebido para token: ...${token.slice(-5)}`, JSON.stringify(update));
 
     try {
@@ -275,18 +328,16 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
 
         if (!botConfig) {
             console.error(`[ERRO] Bot não encontrado no DB para o token: ...${token.slice(-5)}`);
-            return res.sendStatus(200); // Responde 200 para o Telegram não tentar de novo
+            return res.sendStatus(200);
         }
 
         const telegramApi = axios.create({ baseURL: `https://api.telegram.org/bot${token}` });
 
-        // Processa cliques em botões (callback_query)
         if (update.callback_query) {
             const { message, data, from } = update.callback_query;
             const chatId = message.chat.id;
             console.log(`[LOG] Callback Query recebido: '${data}' do usuário ${from.id}`);
 
-            // Extrai o click_id da legenda da imagem de forma mais segura
             const clickIdMatch = message.caption?.match(/ID de Rastreamento:\s*`?(lead\d+)`?/);
             const click_id = clickIdMatch ? clickIdMatch[1] : null;
 
@@ -300,7 +351,6 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
             const sellerApiKey = botConfig.api_key;
             
             if (data === 'generate_pix') {
-                // ATUALIZADO: Usa o valor do PIX configurado no fluxo do bot
                 const value_cents = botConfig.flow_pix_value_cents;
                 if (!value_cents || value_cents <= 0) {
                      console.error(`[ERRO] Valor do PIX não configurado ou inválido para o bot ${botConfig.id}`);
@@ -331,7 +381,7 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
                 try {
                      const vercelUrl = process.env.VERCEL_URL || req.headers.host;
                      console.log(`[LOG] Verificando status do PIX para ${click_id}.`);
-                     const statusResponse = await axios.post(`https://${vercelUrl}/api/pix/check-status`, { click_id }); // Removido API Key, pois sua rota não usa
+                     const statusResponse = await axios.post(`https://${vercelUrl}/api/pix/check-status`, { click_id });
                      const { status } = statusResponse.data;
                      let replyText = 'Aguardando pagamento...';
                      if (status === 'paid') replyText = '✅ Pagamento confirmado! Obrigado.';
@@ -344,7 +394,6 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
             }
         }
         
-        // Processa mensagens de texto, como /start
         else if (update.message && update.message.text) {
             const { chat, text, from } = update.message;
             const chatId = chat.id;
@@ -372,7 +421,6 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
                         ]
                     };
                     
-                    // ATUALIZADO: A legenda agora armazena o click_id de forma mais clara
                     const caption = `${botConfig.flow_text}\n\nID de Rastreamento: \`${click_id}\``;
                     
                     try {
@@ -397,12 +445,10 @@ app.post('/api/telegram/webhook/:token', async (req, res) => {
         console.error('[ERRO FATAL] Erro não tratado no webhook do Telegram:', error);
     }
 
-    // Responde ao Telegram para confirmar o recebimento, mesmo em caso de erro interno
     res.sendStatus(200);
 });
 
-// WEBHOOKS DE PAGAMENTO e sendConversionToMeta
-// (Estas funções continuam as mesmas)
+// --- WEBHOOKS DE PAGAMENTO e sendConversionToMeta ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
     const { id, status } = req.body;
     if (status === 'paid') {
@@ -459,11 +505,8 @@ async function sendConversionToMeta(clickData, pixData) {
     } catch (error) { console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message); }
 }
 
-
 // ROTA PARA SERVIR O FRONTEND
 app.get('*', (req, res) => {
-    // Esta rota garante que o index.html seja servido para qualquer acesso que não seja de API.
-    // Essencial para o funcionamento do Single Page Application (SPA).
     if (!req.path.startsWith('/api/')) {
         res.sendFile(path.resolve(__dirname, 'index.html'));
     } else {
