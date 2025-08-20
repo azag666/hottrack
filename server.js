@@ -245,6 +245,37 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     }
 });
 
+// NOVO ENDPOINT PARA TRANSAÇÕES
+app.get('/api/transactions', authenticateJwt, async (req, res) => {
+    try {
+        const sellerId = req.user.id;
+        const transactions = await sql`
+            SELECT
+                pt.status,
+                pt.pix_value,
+                tb.bot_name,
+                pt.provider,
+                pt.created_at
+            FROM
+                pix_transactions pt
+            JOIN
+                clicks c ON pt.click_id_internal = c.id
+            JOIN
+                pressels p ON c.pressel_id = p.id
+            JOIN
+                telegram_bots tb ON p.bot_id = tb.id
+            WHERE
+                c.seller_id = ${sellerId}
+            ORDER BY
+                pt.created_at DESC;
+        `;
+        res.status(200).json(transactions);
+    } catch (error) {
+        console.error("Erro ao buscar transações:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados das transações.' });
+    }
+});
+
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
