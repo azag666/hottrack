@@ -457,7 +457,8 @@ async function checkPendingTransactions() {
 
                 let providerStatus;
                 if (tx.provider === 'pushinpay') {
-                    const response = await axios.get(`https://api.pushinpay.com.br/api/pix/cashIn/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
+                    // --- LINHA CORRIGIDA AQUI ---
+                    const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'cnpay') {
                     const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${tx.provider_transaction_id}`, { headers: { 'x-public-key': seller.cnpay_public_key, 'x-secret-key': seller.cnpay_secret_key } });
