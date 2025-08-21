@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const path = require('path'); // Adicionado para servir o HTML
 
 const app = express();
 app.use(cors());
@@ -16,7 +17,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
 const PUSHINPAY_SPLIT_ACCOUNT_ID = process.env.PUSHINPAY_SPLIT_ACCOUNT_ID;
 const CNPAY_SPLIT_PRODUCER_ID = process.env.CNPAY_SPLIT_PRODUCER_ID;
 const OASYFY_SPLIT_PRODUCER_ID = process.env.OASYFY_SPLIT_PRODUCER_ID;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY; // Chave secreta para o painel admin
 
 // --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
@@ -51,8 +52,15 @@ app.post('/api/sellers/login', async (req, res) => {
         const sellerResult = await sql`SELECT * FROM sellers WHERE email = ${email}`;
         if (sellerResult.length === 0) return res.status(404).json({ message: 'Usuário não encontrado.' });
         const seller = sellerResult[0];
+
+        // LÓGICA ATUALIZADA: Verifica se o usuário está ativo
+        if (!seller.is_active) {
+            return res.status(403).json({ message: 'Este usuário está bloqueado.' });
+        }
+        
         const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
         if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
+        
         const tokenPayload = { id: seller.id, email: seller.email };
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
@@ -344,10 +352,6 @@ app.post('/api/pix/generate', async (req, res) => {
     }
 });
 
-// ######################################################################
-// ### INÍCIO DAS MUDANÇAS - ROTA DE CONSULTA DE STATUS EM TEMPO REAL ###
-// ######################################################################
-
 app.post('/api/pix/check-status', async (req, res) => {
     const { click_id } = req.body;
     if (!click_id) {
@@ -355,7 +359,6 @@ app.post('/api/pix/check-status', async (req, res) => {
     }
 
     try {
-        // LÓGICA ATUALIZADA: Busca todas as informações necessárias para a consulta em tempo real
         const [transaction] = await sql`
             SELECT 
                 pt.id,
@@ -376,17 +379,14 @@ app.post('/api/pix/check-status', async (req, res) => {
             LIMIT 1
         `;
 
-        // Se não encontrar nenhuma transação, retorna not_found
         if (!transaction) {
             return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
         }
 
-        // OTIMIZAÇÃO: Se o status no nosso banco já é 'paid', não precisamos consultar de novo.
         if (transaction.status === 'paid') {
             return res.status(200).json({ status: 'paid', value: transaction.pix_value });
         }
 
-        // NOVO: CONSULTA EM TEMPO REAL SE O STATUS FOR 'pending'
         let providerStatus;
         try {
             if (transaction.provider === 'pushinpay') {
@@ -400,15 +400,11 @@ app.post('/api/pix/check-status', async (req, res) => {
                 providerStatus = response.data.status;
             }
         } catch (error) {
-            // Se a consulta ao provedor falhar, não quebramos a aplicação.
-            // Apenas retornamos o status que já temos no banco ('pending').
             console.error(`Falha ao consultar o provedor ${transaction.provider} para a transação ${transaction.id}:`, error.message);
             return res.status(200).json({ status: 'pending' });
         }
         
-        // LÓGICA ATUALIZADA: Se o provedor disser que foi pago, atualizamos nosso banco e retornamos 'paid'
         if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
-            // Atualiza o banco de dados para refletir o status real
             const [updatedTx] = await sql`
                 UPDATE pix_transactions
                 SET status = 'paid', paid_at = NOW()
@@ -416,7 +412,6 @@ app.post('/api/pix/check-status', async (req, res) => {
                 RETURNING *
             `;
             
-            // Se a atualização ocorreu, também disparamos o evento para a Meta
             if (updatedTx) {
                 const [click] = await sql`SELECT * FROM clicks WHERE click_id = ${click_id}`;
                 if(click) await sendConversionToMeta(click, updatedTx);
@@ -425,7 +420,6 @@ app.post('/api/pix/check-status', async (req, res) => {
             return res.status(200).json({ status: 'paid', value: transaction.pix_value });
         }
 
-        // Se chegou até aqui, o status no provedor ainda é 'pending' ou outro não pago.
         return res.status(200).json({ status: 'pending' });
 
     } catch (error) {
@@ -433,12 +427,6 @@ app.post('/api/pix/check-status', async (req, res) => {
         res.status(500).json({ message: 'Erro interno ao consultar status.' });
     }
 });
-
-
-// ######################################################################
-// ### FIM DAS MUDANÇAS                                               ###
-// ######################################################################
-
 
 // --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
@@ -480,7 +468,6 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     }
     res.sendStatus(200);
 });
-
 
 async function sendConversionToMeta(clickData, pixData) {
     try {
@@ -567,5 +554,161 @@ async function checkPendingTransactions() {
 
 // Inicia a rotina de verificação (reduzi para 2 minutos como teste, pode ajustar)
 setInterval(checkPendingTransactions, 120000);
+
+
+// ######################################################################
+// ### INÍCIO DAS ROTAS DO PAINEL ADMINISTRATIVO                      ###
+// ######################################################################
+
+// Middleware para autenticação do Admin
+function authenticateAdmin(req, res, next) {
+    const adminKey = req.headers['x-admin-api-key'];
+    if (!adminKey || adminKey !== ADMIN_API_KEY) {
+        return res.status(403).json({ message: 'Acesso negado. Chave de administrador inválida.' });
+    }
+    next();
+}
+
+// Rota para o dashboard do admin com métricas globais
+app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
+    try {
+        const totalSellers = await sql`SELECT COUNT(*) FROM sellers;`;
+        const paidTransactions = await sql`SELECT COUNT(*) as count, SUM(pix_value) as total_revenue FROM pix_transactions WHERE status = 'paid';`;
+
+        const total_sellers = parseInt(totalSellers[0].count);
+        const total_paid_transactions = parseInt(paidTransactions[0].count);
+        const total_revenue = parseFloat(paidTransactions[0].total_revenue || 0);
+        const saas_profit = total_revenue * 0.0299; // Sua comissão
+
+        res.json({
+            total_sellers,
+            total_paid_transactions,
+            total_revenue: total_revenue.toFixed(2),
+            saas_profit: saas_profit.toFixed(2)
+        });
+    } catch (error) {
+        console.error("Erro no dashboard admin:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' });
+    }
+});
+
+// Rota para o ranking de sellers
+app.get('/api/admin/ranking', authenticateAdmin, async (req, res) => {
+    try {
+        const ranking = await sql`
+            SELECT
+                s.id, s.name, s.email,
+                COUNT(pt.id) AS total_sales,
+                COALESCE(SUM(pt.pix_value), 0) AS total_revenue
+            FROM sellers s
+            LEFT JOIN clicks c ON s.id = c.seller_id
+            LEFT JOIN pix_transactions pt ON c.id = pt.click_id_internal AND pt.status = 'paid'
+            GROUP BY s.id, s.name, s.email
+            ORDER BY total_revenue DESC
+            LIMIT 20;
+        `;
+        res.json(ranking);
+    } catch (error) {
+        console.error("Erro no ranking de sellers:", error);
+        res.status(500).json({ message: 'Erro ao buscar ranking.' });
+    }
+});
+
+// Rota para listar todos os sellers
+app.get('/api/admin/sellers', authenticateAdmin, async (req, res) => {
+    try {
+        const sellers = await sql`SELECT id, name, email, created_at, is_active FROM sellers ORDER BY created_at DESC;`;
+        res.json(sellers);
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao listar vendedores.' });
+    }
+});
+
+// Rota para bloquear/desbloquear um seller
+app.post('/api/admin/sellers/:id/toggle-active', authenticateAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { isActive } = req.body;
+    try {
+        await sql`UPDATE sellers SET is_active = ${isActive} WHERE id = ${id};`;
+        res.status(200).json({ message: `Usuário ${isActive ? 'ativado' : 'bloqueado'} com sucesso.` });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao alterar status do usuário.' });
+    }
+});
+
+// Rota para alterar a senha de um seller
+app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8) {
+        return res.status(400).json({ message: 'A nova senha deve ter pelo menos 8 caracteres.' });
+    }
+    try {
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        await sql`UPDATE sellers SET password_hash = ${hashedPassword} WHERE id = ${id};`;
+        res.status(200).json({ message: 'Senha alterada com sucesso.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao alterar senha.' });
+    }
+});
+
+// Rota para alterar credenciais de um seller
+app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body; // adicione outras chaves se precisar
+    try {
+        await sql`
+            UPDATE sellers 
+            SET 
+                pushinpay_token = ${pushinpay_token},
+                cnpay_public_key = ${cnpay_public_key},
+                cnpay_secret_key = ${cnpay_secret_key}
+                -- adicione outras chaves aqui
+            WHERE id = ${id};
+        `;
+        res.status(200).json({ message: 'Credenciais alteradas com sucesso.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao alterar credenciais.' });
+    }
+});
+
+// Rota para listar todas as transações
+app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
+    try {
+        const page = parseInt(req.query.page || 1);
+        const limit = parseInt(req.query.limit || 20);
+        const offset = (page - 1) * limit;
+
+        const transactions = await sql`
+            SELECT
+                pt.id, pt.status, pt.pix_value, pt.provider, pt.created_at,
+                s.name as seller_name, s.email as seller_email
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            JOIN sellers s ON c.seller_id = s.id
+            ORDER BY pt.created_at DESC
+            LIMIT ${limit} OFFSET ${offset};
+        `;
+         const totalTransactionsResult = await sql`SELECT COUNT(*) FROM pix_transactions;`;
+         const total = parseInt(totalTransactionsResult[0].count);
+
+        res.json({
+            transactions,
+            total,
+            page,
+            pages: Math.ceil(total / limit),
+            limit
+        });
+    } catch (error) {
+        console.error("Erro ao buscar transações admin:", error);
+        res.status(500).json({ message: 'Erro ao buscar transações.' });
+    }
+});
+
+// Rota para servir o arquivo HTML do painel admin
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 
 module.exports = app;
