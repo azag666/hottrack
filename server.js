@@ -171,15 +171,12 @@ app.post('/api/click/info', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' }); }
 });
 
-// Nova rota para as métricas do dashboard
+// --- ROTAS DE DASHBOARD E TRANSAÇÕES ---
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
-        
-        // Métricas Globais
         const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
         const totalClicks = totalClicksResult[0].count;
-
         const totalPixGeneratedResult = await sql`
             SELECT 
                 COUNT(pt.id) AS total_pix_generated,
@@ -189,7 +186,6 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             WHERE c.seller_id = ${sellerId}`;
         const totalPixGenerated = totalPixGeneratedResult[0].total_pix_generated;
         const totalRevenue = totalPixGeneratedResult[0].total_revenue;
-
         const totalPixPaidResult = await sql`
             SELECT 
                 COUNT(pt.id) AS total_pix_paid,
@@ -199,10 +195,7 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             WHERE c.seller_id = ${sellerId} AND pt.status = 'paid'`;
         const totalPixPaid = totalPixPaidResult[0].total_pix_paid;
         const paidRevenue = totalPixPaidResult[0].paid_revenue;
-
         const conversionRate = totalClicks > 0 ? ((totalPixPaid / totalClicks) * 100).toFixed(2) : 0;
-        
-        // Métricas por Bot
         const botsPerformance = await sql`
             SELECT
                 tb.bot_name,
@@ -216,8 +209,6 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             WHERE tb.seller_id = ${sellerId}
             GROUP BY tb.bot_name
             ORDER BY paid_revenue DESC, total_clicks DESC`;
-        
-        // Métricas de Tráfego por Estado
         const clicksByState = await sql`
             SELECT 
                 c.state,
@@ -227,7 +218,6 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             GROUP BY c.state
             ORDER BY total_clicks DESC
             LIMIT 10`;
-
         res.status(200).json({
             total_clicks: parseInt(totalClicks),
             total_pix_generated: parseInt(totalPixGenerated),
@@ -238,14 +228,11 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
             bots_performance: botsPerformance.map(b => ({ ...b, total_clicks: parseInt(b.total_clicks), total_pix_paid: parseInt(b.total_pix_paid), paid_revenue: parseFloat(b.paid_revenue) })),
             clicks_by_state: clicksByState.map(s => ({ ...s, total_clicks: parseInt(s.total_clicks) }))
         });
-
     } catch (error) {
         console.error("Erro ao buscar métricas do dashboard:", error);
         res.status(500).json({ message: 'Erro interno do servidor.' });
     }
 });
-
-// NOVO ENDPOINT PARA TRANSAÇÕES
 app.get('/api/transactions', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -276,6 +263,7 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
     }
 });
 
+// --- ROTAS DE GERAÇÃO E CONSULTA DE PIX ---
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
@@ -356,16 +344,101 @@ app.post('/api/pix/generate', async (req, res) => {
     }
 });
 
+// ######################################################################
+// ### INÍCIO DAS MUDANÇAS - ROTA DE CONSULTA DE STATUS EM TEMPO REAL ###
+// ######################################################################
+
 app.post('/api/pix/check-status', async (req, res) => {
     const { click_id } = req.body;
+    if (!click_id) {
+        return res.status(400).json({ message: 'O click_id é obrigatório.' });
+    }
+
     try {
-        const transactions = await sql`SELECT pt.status, pt.pix_value FROM pix_transactions pt JOIN clicks c ON pt.click_id_internal = c.id WHERE c.click_id = ${click_id}`;
-        if (transactions.length === 0) return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
-        const paidTransaction = transactions.find(t => t.status === 'paid');
-        if (paidTransaction) return res.status(200).json({ status: 'paid', value: paidTransaction.pix_value });
+        // LÓGICA ATUALIZADA: Busca todas as informações necessárias para a consulta em tempo real
+        const [transaction] = await sql`
+            SELECT 
+                pt.id,
+                pt.status,
+                pt.pix_value,
+                pt.provider,
+                pt.provider_transaction_id,
+                s.pushinpay_token,
+                s.cnpay_public_key,
+                s.cnpay_secret_key,
+                s.oasyfy_public_key,
+                s.oasyfy_secret_key
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            JOIN sellers s ON c.seller_id = s.id
+            WHERE c.click_id = ${click_id}
+            ORDER BY pt.created_at DESC
+            LIMIT 1
+        `;
+
+        // Se não encontrar nenhuma transação, retorna not_found
+        if (!transaction) {
+            return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
+        }
+
+        // OTIMIZAÇÃO: Se o status no nosso banco já é 'paid', não precisamos consultar de novo.
+        if (transaction.status === 'paid') {
+            return res.status(200).json({ status: 'paid', value: transaction.pix_value });
+        }
+
+        // NOVO: CONSULTA EM TEMPO REAL SE O STATUS FOR 'pending'
+        let providerStatus;
+        try {
+            if (transaction.provider === 'pushinpay') {
+                const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${transaction.provider_transaction_id}`, { headers: { Authorization: `Bearer ${transaction.pushinpay_token}` } });
+                providerStatus = response.data.status;
+            } else if (transaction.provider === 'cnpay') {
+                const response = await axios.get(`https://painel.appcnpay.com/api/v1/gateway/pix/receive/${transaction.provider_transaction_id}`, { headers: { 'x-public-key': transaction.cnpay_public_key, 'x-secret-key': transaction.cnpay_secret_key } });
+                providerStatus = response.data.status;
+            } else if (transaction.provider === 'oasyfy') {
+                const response = await axios.get(`https://app.oasyfy.com/api/v1/gateway/pix/receive/${transaction.provider_transaction_id}`, { headers: { 'x-public-key': transaction.oasyfy_public_key, 'x-secret-key': transaction.oasyfy_secret_key } });
+                providerStatus = response.data.status;
+            }
+        } catch (error) {
+            // Se a consulta ao provedor falhar, não quebramos a aplicação.
+            // Apenas retornamos o status que já temos no banco ('pending').
+            console.error(`Falha ao consultar o provedor ${transaction.provider} para a transação ${transaction.id}:`, error.message);
+            return res.status(200).json({ status: 'pending' });
+        }
+        
+        // LÓGICA ATUALIZADA: Se o provedor disser que foi pago, atualizamos nosso banco e retornamos 'paid'
+        if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
+            // Atualiza o banco de dados para refletir o status real
+            const [updatedTx] = await sql`
+                UPDATE pix_transactions
+                SET status = 'paid', paid_at = NOW()
+                WHERE id = ${transaction.id} AND status != 'paid'
+                RETURNING *
+            `;
+            
+            // Se a atualização ocorreu, também disparamos o evento para a Meta
+            if (updatedTx) {
+                const [click] = await sql`SELECT * FROM clicks WHERE click_id = ${click_id}`;
+                if(click) await sendConversionToMeta(click, updatedTx);
+            }
+
+            return res.status(200).json({ status: 'paid', value: transaction.pix_value });
+        }
+
+        // Se chegou até aqui, o status no provedor ainda é 'pending' ou outro não pago.
         return res.status(200).json({ status: 'pending' });
-    } catch (error) { res.status(500).json({ message: 'Erro ao consultar status.' }); }
+
+    } catch (error) {
+        console.error("Erro ao consultar status do PIX:", error);
+        res.status(500).json({ message: 'Erro interno ao consultar status.' });
+    }
 });
+
+
+// ######################################################################
+// ### FIM DAS MUDANÇAS                                               ###
+// ######################################################################
+
 
 // --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
@@ -457,7 +530,6 @@ async function checkPendingTransactions() {
 
                 let providerStatus;
                 if (tx.provider === 'pushinpay') {
-                    // --- LINHA CORRIGIDA AQUI ---
                     const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${tx.provider_transaction_id}`, { headers: { Authorization: `Bearer ${seller.pushinpay_token}` } });
                     providerStatus = response.data.status;
                 } else if (tx.provider === 'cnpay') {
@@ -493,7 +565,7 @@ async function checkPendingTransactions() {
     }
 }
 
-// Inicia a rotina de verificação a cada 10 minutos (600000 ms)
-setInterval(checkPendingTransactions, 200000);
+// Inicia a rotina de verificação (reduzi para 2 minutos como teste, pode ajustar)
+setInterval(checkPendingTransactions, 120000);
 
 module.exports = app;
