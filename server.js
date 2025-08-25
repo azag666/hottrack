@@ -473,16 +473,40 @@ async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
         if (presselPixels.length === 0) return;
+
+        // Limpa o click_id para ser usado como external_id
+        const externalId = clickData.click_id ? clickData.click_id.replace('/start ', '') : null;
+
         for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
             if (pixelConfig) {
-                const { pixel_id, meta_api_token } = pixelConfig; const event_id = `pix.${pixData.id}.${pixel_id}`;
-                const payload = { data: [{ event_name: 'Purchase', event_time: Math.floor(Date.now() / 1000), event_id, user_data: { fbp: clickData.fbp, fbc: clickData.fbc, client_ip_address: clickData.ip_address, client_user_agent: clickData.user_agent }, custom_data: { currency: 'BRL', value: pixData.pix_value }, }]};
+                const { pixel_id, meta_api_token } = pixelConfig;
+                const event_id = `pix.${pixData.id}.${pixel_id}`;
+                const payload = {
+                    data: [{
+                        event_name: 'Purchase',
+                        event_time: Math.floor(Date.now() / 1000),
+                        event_id,
+                        user_data: {
+                            external_id: externalId, // ID Externo adicionado aqui
+                            fbp: clickData.fbp,
+                            fbc: clickData.fbc,
+                            client_ip_address: clickData.ip_address,
+                            client_user_agent: clickData.user_agent
+                        },
+                        custom_data: {
+                            currency: 'BRL',
+                            value: pixData.pix_value
+                        },
+                    }]
+                };
                 await axios.post(`https://graph.facebook.com/v19.0/${pixel_id}/events`, payload, { params: { access_token: meta_api_token } });
                 await sql`UPDATE pix_transactions SET meta_event_id = ${event_id} WHERE id = ${pixData.id}`;
             }
         }
-    } catch (error) { console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message); }
+    } catch (error) {
+        console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message);
+    }
 }
 
 // --- FUNÇÃO DE CONSULTA PERIÓDICA ---
