@@ -84,6 +84,7 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
+// (As rotas CRUD permanecem inalteradas)
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
@@ -141,6 +142,7 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
+// (As rotas /api/registerClick e /api/click/info permanecem inalteradas)
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -177,6 +179,7 @@ app.post('/api/click/info', async (req, res) => {
 });
 
 // --- ROTAS DE DASHBOARD E TRANSAÇÕES ---
+// (As rotas de dashboard e transações permanecem inalteradas)
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -269,6 +272,7 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERAÇÃO E CONSULTA DE PIX ---
+// (As rotas de PIX permanecem inalteradas)
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
@@ -426,6 +430,7 @@ app.post('/api/pix/check-status', async (req, res) => {
 });
 
 // --- WEBHOOKS ---
+// (As rotas de webhook permanecem inalteradas)
 app.post('/api/webhook/pushinpay', async (req, res) => {
     const { id, status } = req.body;
     if (status === 'paid') {
@@ -466,6 +471,10 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     res.sendStatus(200);
 });
 
+
+// ##################################################################
+// ### FUNÇÃO sendConversionToMeta ATUALIZADA COM HASHING DE DADOS ###
+// ##################################################################
 async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
@@ -474,9 +483,9 @@ async function sendConversionToMeta(clickData, pixData) {
         const externalId = clickData.click_id ? clickData.click_id.replace('/start ', '') : null;
         
         // Normaliza e prepara os dados de PII
-        const city = clickData.city && clickData.city !== 'Desconhecida' ? clickData.city.toLowerCase().replace(/[^a-z]/g, '') : null;
-        const state = clickData.state && clickData.state !== 'Desconhecido' ? clickData.state.toLowerCase().replace(/[^a-z]/g, '') : null;
-        const gender = 'm';
+        const city = clickData.city ? clickData.city.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const state = clickData.state ? clickData.state.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const gender = 'm'; // Gênero masculino, conforme solicitado
 
         for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
@@ -490,11 +499,13 @@ async function sendConversionToMeta(clickData, pixData) {
                     fbc: clickData.fbc,
                     client_ip_address: clickData.ip_address,
                     client_user_agent: clickData.user_agent,
+                    // Converte os campos de PII em hash SHA256
                     ge: crypto.createHash('sha256').update(gender).digest('hex'),
                     ct: city ? crypto.createHash('sha256').update(city).digest('hex') : null,
                     st: state ? crypto.createHash('sha256').update(state).digest('hex') : null,
                 };
                 
+                // Remove chaves nulas do objeto userData para não enviar dados vazios
                 Object.keys(userData).forEach(key => (userData[key] === null) && delete userData[key]);
 
                 const payload = {
@@ -518,6 +529,8 @@ async function sendConversionToMeta(clickData, pixData) {
     }
 }
 
+// --- FUNÇÃO DE CONSULTA PERIÓDICA ---
+// (A função checkPendingTransactions permanece inalterada)
 async function checkPendingTransactions() {
     console.log('Iniciando verificação de transações pendentes...');
     try {
@@ -586,6 +599,7 @@ async function checkPendingTransactions() {
 setInterval(checkPendingTransactions, 120000);
 
 // --- ROTAS DO PAINEL ADMINISTRATIVO ---
+// (As rotas do admin permanecem inalteradas)
 function authenticateAdmin(req, res, next) {
     const adminKey = req.headers['x-admin-api-key'];
     if (!adminKey || adminKey !== ADMIN_API_KEY) {
@@ -601,7 +615,7 @@ app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
         const total_sellers = parseInt(totalSellers[0].count);
         const total_paid_transactions = parseInt(paidTransactions[0].count);
         const total_revenue = parseFloat(paidTransactions[0].total_revenue || 0);
-        const saas_profit = total_revenue * 0.0299;
+        const saas_profit = total_revenue * 0.0299; // Sua comissão
 
         res.json({
             total_sellers,
@@ -668,7 +682,7 @@ app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) =
 });
 app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
-    const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body;
+    const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body; // adicione outras chaves se precisar
     try {
         await sql`
             UPDATE sellers 
@@ -676,6 +690,7 @@ app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res
                 pushinpay_token = ${pushinpay_token},
                 cnpay_public_key = ${cnpay_public_key},
                 cnpay_secret_key = ${cnpay_secret_key}
+                -- adicione outras chaves aqui
             WHERE id = ${id};
         `;
         res.status(200).json({ message: 'Credenciais alteradas com sucesso.' });
