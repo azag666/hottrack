@@ -6,14 +6,20 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const path = require('path');
-const crypto = require('crypto'); // Biblioteca para criptografia
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- FUNÇÃO PARA OBTER CONEXÃO COM O BANCO ---
+// Em vez de uma conexão global, chamaremos esta função em cada rota
+// para garantir um gerenciamento de conexão eficiente no ambiente serverless.
+function getDbConnection() {
+    return neon(process.env.DATABASE_URL);
+}
+
 // --- CONFIGURAÇÃO ---
-const sql = neon(process.env.DATABASE_URL);
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
 const PUSHINPAY_SPLIT_ACCOUNT_ID = process.env.PUSHINPAY_SPLIT_ACCOUNT_ID;
 const CNPAY_SPLIT_PRODUCER_ID = process.env.CNPAY_SPLIT_PRODUCER_ID;
@@ -34,6 +40,7 @@ async function authenticateJwt(req, res, next) {
 
 // --- ROTAS DE AUTENTICAÇÃO ---
 app.post('/api/sellers/register', async (req, res) => {
+    const sql = getDbConnection();
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
     try {
@@ -43,10 +50,14 @@ app.post('/api/sellers/register', async (req, res) => {
         const apiKey = uuidv4();
         await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${email}, ${hashedPassword}, ${apiKey})`;
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no registro:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
 app.post('/api/sellers/login', async (req, res) => {
+    const sql = getDbConnection();
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
     try {
@@ -62,11 +73,15 @@ app.post('/api/sellers/login', async (req, res) => {
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
         res.status(200).json({ message: 'Login bem-sucedido!', token, seller: sellerData });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no login:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 
 // --- ROTA DE DADOS DO PAINEL ---
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const sellerId = req.user.id;
         const settingsPromise = sql`SELECT api_key, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key, active_pix_provider FROM sellers WHERE id = ${sellerId}`;
@@ -80,12 +95,15 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
         const [settingsResult, pixels, pressels, bots] = await Promise.all([settingsPromise, pixelsPromise, presselsPromise, botsPromise]);
         const settings = settingsResult[0] || { api_key: null, pushinpay_token: null, cnpay_public_key: null, cnpay_secret_key: null, oasyfy_public_key: null, oasyfy_secret_key: null, active_pix_provider: 'pushinpay' };
         res.json({ settings, pixels, pressels, bots });
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar dados.' }); }
+    } catch (error) {
+        console.error("Erro ao buscar dados do dashboard:", error);
+        res.status(500).json({ message: 'Erro ao buscar dados.' });
+    }
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
-// (As rotas CRUD permanecem inalteradas)
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     try {
@@ -93,79 +111,142 @@ app.post('/api/pixels', authenticateJwt, async (req, res) => {
         res.status(201).json(newPixel[0]);
     } catch (error) {
         if (error.code === '23505') { return res.status(409).json({ message: 'Este ID de Pixel já foi cadastrado.' }); }
+        console.error("Erro ao salvar pixel:", error);
         res.status(500).json({ message: 'Erro ao salvar o pixel.' });
     }
 });
+
 app.delete('/api/pixels/:id', authenticateJwt, async (req, res) => {
-    try { await sql`DELETE FROM pixel_configurations WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`; res.status(204).send(); } catch (error) { res.status(500).json({ message: 'Erro ao excluir o pixel.' }); }
+    const sql = getDbConnection();
+    try {
+        await sql`DELETE FROM pixel_configurations WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) {
+        console.error("Erro ao excluir pixel:", error);
+        res.status(500).json({ message: 'Erro ao excluir o pixel.' });
+    }
 });
+
 app.post('/api/bots', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     const { bot_name, bot_token } = req.body;
-    if(!bot_name || !bot_token) return res.status(400).json({ message: 'Nome e token são obrigatórios.' });
+    if (!bot_name || !bot_token) return res.status(400).json({ message: 'Nome e token são obrigatórios.' });
     try {
         const newBot = await sql`INSERT INTO telegram_bots (seller_id, bot_name, bot_token) VALUES (${req.user.id}, ${bot_name}, ${bot_token}) RETURNING *;`;
         res.status(201).json(newBot[0]);
     } catch (error) {
-        if (error.code === '23505') { return res.status(409).json({ message: 'Um bot com este nome já existe.' });}
+        if (error.code === '23505') { return res.status(409).json({ message: 'Um bot com este nome já existe.' }); }
+        console.error("Erro ao salvar bot:", error);
         res.status(500).json({ message: 'Erro ao salvar o bot.' });
     }
 });
+
 app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
-    try { await sql`DELETE FROM telegram_bots WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`; res.status(204).send(); } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
+    const sql = getDbConnection();
+    try {
+        await sql`DELETE FROM telegram_bots WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) {
+        console.error("Erro ao excluir bot:", error);
+        res.status(500).json({ message: 'Erro ao excluir o bot.' });
+    }
 });
+
 app.post('/api/pressels', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     const { name, bot_id, white_page_url, pixel_ids } = req.body;
     if (!name || !bot_id || !white_page_url || !Array.isArray(pixel_ids) || pixel_ids.length === 0) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
     try {
-        const numeric_bot_id = parseInt(bot_id, 10); const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
+        const numeric_bot_id = parseInt(bot_id, 10);
+        const numeric_pixel_ids = pixel_ids.map(id => parseInt(id, 10));
         const botResult = await sql`SELECT bot_name FROM telegram_bots WHERE id = ${numeric_bot_id} AND seller_id = ${req.user.id}`;
         if (botResult.length === 0) return res.status(404).json({ message: 'Bot não encontrado.' });
         const bot_name = botResult[0].bot_name;
         await sql`BEGIN`;
         try {
             const [newPressel] = await sql`INSERT INTO pressels (seller_id, name, bot_id, bot_name, white_page_url) VALUES (${req.user.id}, ${name}, ${numeric_bot_id}, ${bot_name}, ${white_page_url}) RETURNING *;`;
-            for (const pixelId of numeric_pixel_ids) { await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})` }
+            for (const pixelId of numeric_pixel_ids) {
+                await sql`INSERT INTO pressel_pixels (pressel_id, pixel_config_id) VALUES (${newPressel.id}, ${pixelId})`;
+            }
             await sql`COMMIT`;
             res.status(201).json({ ...newPressel, pixel_ids: numeric_pixel_ids });
-        } catch (transactionError) { await sql`ROLLBACK`; throw transactionError; }
-    } catch (error) { res.status(500).json({ message: 'Erro ao salvar a pressel.' }); }
+        } catch (transactionError) {
+            await sql`ROLLBACK`;
+            throw transactionError;
+        }
+    } catch (error) {
+        console.error("Erro ao salvar pressel:", error);
+        res.status(500).json({ message: 'Erro ao salvar a pressel.' });
+    }
 });
+
 app.delete('/api/pressels/:id', authenticateJwt, async (req, res) => {
-    try { await sql`DELETE FROM pressels WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`; res.status(204).send(); } catch (error) { res.status(500).json({ message: 'Erro ao excluir a pressel.' }); }
+    const sql = getDbConnection();
+    try {
+        await sql`DELETE FROM pressels WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        res.status(204).send();
+    } catch (error) {
+        console.error("Erro ao excluir pressel:", error);
+        res.status(500).json({ message: 'Erro ao excluir a pressel.' });
+    }
 });
+
 app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     const { active_pix_provider, pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key } = req.body;
     try {
-        await sql`UPDATE sellers SET active_pix_provider = ${active_pix_provider}, pushinpay_token = ${pushinpay_token || null}, cnpay_public_key = ${cnpay_public_key || null}, cnpay_secret_key = ${cnpay_secret_key || null}, oasyfy_public_key = ${oasyfy_public_key || null}, oasyfy_secret_key = ${oasyfy_secret_key || null} WHERE id = ${req.user.id}`;
+        await sql`UPDATE sellers SET 
+            active_pix_provider = ${active_pix_provider}, 
+            pushinpay_token = ${pushinpay_token || null}, 
+            cnpay_public_key = ${cnpay_public_key || null}, 
+            cnpay_secret_key = ${cnpay_secret_key || null}, 
+            oasyfy_public_key = ${oasyfy_public_key || null}, 
+            oasyfy_secret_key = ${oasyfy_secret_key || null} 
+            WHERE id = ${req.user.id}`;
         res.status(200).json({ message: 'Configurações de PIX salvas com sucesso.' });
-    } catch (error) { res.status(500).json({ message: 'Erro ao salvar as configurações.' }); }
+    } catch (error) {
+        console.error("Erro ao salvar configurações de PIX:", error);
+        res.status(500).json({ message: 'Erro ao salvar as configurações.' });
+    }
 });
 
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
-// (As rotas /api/registerClick e /api/click/info permanecem inalteradas)
 app.post('/api/registerClick', async (req, res) => {
+    const sql = getDbConnection();
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
     const ip_address = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
-    let city = 'Desconhecida', state = 'Desconhecido';
+    let city = 'Desconhecida',
+        state = 'Desconhecido';
     try {
         if (ip_address && ip_address !== '::1' && !ip_address.startsWith('192.168.')) {
             const geo = await axios.get(`http://ip-api.com/json/${ip_address}?fields=city,regionName`);
-            city = geo.data.city || city; state = geo.data.regionName || state;
+            city = geo.data.city || city;
+            state = geo.data.regionName || state;
         }
-    } catch (e) { console.error("Erro ao buscar geolocalização"); }
+    } catch (e) {
+        console.error("Erro ao buscar geolocalização:", e.message);
+    }
     try {
-        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, city, state, fbclid, fbp, fbc) SELECT s.id, ${presselId}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbp}, ${fbc} FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
+        const result = await sql`INSERT INTO clicks (seller_id, pressel_id, ip_address, user_agent, referer, city, state, fbclid, fbp, fbc) 
+            SELECT s.id, ${presselId}, ${ip_address}, ${user_agent}, ${referer}, ${city}, ${state}, ${fbclid}, ${fbp}, ${fbc} 
+            FROM sellers s WHERE s.api_key = ${sellerApiKey} RETURNING id;`;
         if (result.length === 0) return res.status(404).json({ message: 'API Key ou Pressel inválida.' });
         const click_record_id = result[0].id;
         const clean_click_id = `lead${click_record_id.toString().padStart(6, '0')}`;
         const db_click_id = `/start ${clean_click_id}`;
         await sql`UPDATE clicks SET click_id = ${db_click_id} WHERE id = ${click_record_id}`;
         res.status(200).json({ status: 'success', click_id: clean_click_id });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro ao registrar clique:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
+
 app.post('/api/click/info', async (req, res) => {
-    const apiKey = req.headers['x-api-key']; const { click_id } = req.body;
+    const sql = getDbConnection();
+    const apiKey = req.headers['x-api-key'];
+    const { click_id } = req.body;
     if (!apiKey || !click_id) return res.status(400).json({ message: 'API Key e click_id são obrigatórios.' });
     try {
         const sellerResult = await sql`SELECT id FROM sellers WHERE api_key = ${apiKey}`;
@@ -175,12 +256,15 @@ app.post('/api/click/info', async (req, res) => {
         if (clickResult.length === 0) return res.status(404).json({ message: 'Click ID não encontrado para este vendedor.' });
         const clickInfo = clickResult[0];
         res.status(200).json({ status: 'success', city: clickInfo.city, state: clickInfo.state });
-    } catch (error) { res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' }); }
+    } catch (error) {
+        console.error("Erro ao consultar informações do clique:", error);
+        res.status(500).json({ message: 'Erro interno ao consultar informações do clique.' });
+    }
 });
 
 // --- ROTAS DE DASHBOARD E TRANSAÇÕES ---
-// (As rotas de dashboard e transações permanecem inalteradas)
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const sellerId = req.user.id;
         const totalClicksResult = await sql`SELECT COUNT(*) FROM clicks WHERE seller_id = ${sellerId}`;
@@ -242,28 +326,17 @@ app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     }
 });
 app.get('/api/transactions', authenticateJwt, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const sellerId = req.user.id;
         const transactions = await sql`
-            SELECT
-                pt.status,
-                pt.pix_value,
-                tb.bot_name,
-                pt.provider,
-                pt.created_at
-            FROM
-                pix_transactions pt
-            JOIN
-                clicks c ON pt.click_id_internal = c.id
-            JOIN
-                pressels p ON c.pressel_id = p.id
-            JOIN
-                telegram_bots tb ON p.bot_id = tb.id
-            WHERE
-                c.seller_id = ${sellerId}
-            ORDER BY
-                pt.created_at DESC;
-        `;
+            SELECT pt.status, pt.pix_value, tb.bot_name, pt.provider, pt.created_at
+            FROM pix_transactions pt
+            JOIN clicks c ON pt.click_id_internal = c.id
+            JOIN pressels p ON c.pressel_id = p.id
+            JOIN telegram_bots tb ON p.bot_id = tb.id
+            WHERE c.seller_id = ${sellerId}
+            ORDER BY pt.created_at DESC;`;
         res.status(200).json(transactions);
     } catch (error) {
         console.error("Erro ao buscar transações:", error);
@@ -272,8 +345,8 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERAÇÃO E CONSULTA DE PIX ---
-// (As rotas de PIX permanecem inalteradas)
 app.post('/api/pix/generate', async (req, res) => {
+    const sql = getDbConnection();
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
     if (!apiKey || !click_id || !value_cents) return res.status(400).json({ message: 'API Key, click_id e value_cents são obrigatórios.' });
@@ -354,6 +427,7 @@ app.post('/api/pix/generate', async (req, res) => {
 });
 
 app.post('/api/pix/check-status', async (req, res) => {
+    const sql = getDbConnection();
     const { click_id } = req.body;
     if (!click_id) {
         return res.status(400).json({ message: 'O click_id é obrigatório.' });
@@ -362,23 +436,14 @@ app.post('/api/pix/check-status', async (req, res) => {
     try {
         const [transaction] = await sql`
             SELECT 
-                pt.id,
-                pt.status,
-                pt.pix_value,
-                pt.provider,
-                pt.provider_transaction_id,
-                s.pushinpay_token,
-                s.cnpay_public_key,
-                s.cnpay_secret_key,
-                s.oasyfy_public_key,
-                s.oasyfy_secret_key
+                pt.id, pt.status, pt.pix_value, pt.provider, pt.provider_transaction_id,
+                s.pushinpay_token, s.cnpay_public_key, s.cnpay_secret_key, s.oasyfy_public_key, s.oasyfy_secret_key
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
             JOIN sellers s ON c.seller_id = s.id
             WHERE c.click_id = ${click_id}
             ORDER BY pt.created_at DESC
-            LIMIT 1
-        `;
+            LIMIT 1`;
 
         if (!transaction) {
             return res.status(200).json({ status: 'not_found', message: 'Nenhuma cobrança PIX encontrada.' });
@@ -407,11 +472,9 @@ app.post('/api/pix/check-status', async (req, res) => {
         
         if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
             const [updatedTx] = await sql`
-                UPDATE pix_transactions
-                SET status = 'paid', paid_at = NOW()
+                UPDATE pix_transactions SET status = 'paid', paid_at = NOW()
                 WHERE id = ${transaction.id} AND status != 'paid'
-                RETURNING *
-            `;
+                RETURNING *`;
             
             if (updatedTx) {
                 const [click] = await sql`SELECT * FROM clicks WHERE click_id = ${click_id}`;
@@ -430,8 +493,8 @@ app.post('/api/pix/check-status', async (req, res) => {
 });
 
 // --- WEBHOOKS ---
-// (As rotas de webhook permanecem inalteradas)
 app.post('/api/webhook/pushinpay', async (req, res) => {
+    const sql = getDbConnection();
     const { id, status } = req.body;
     if (status === 'paid') {
         try {
@@ -445,6 +508,7 @@ app.post('/api/webhook/pushinpay', async (req, res) => {
     res.sendStatus(200);
 });
 app.post('/api/webhook/cnpay', async (req, res) => {
+    const sql = getDbConnection();
     const { transactionId, status } = req.body;
     if (status === 'COMPLETED') {
         try {
@@ -458,6 +522,7 @@ app.post('/api/webhook/cnpay', async (req, res) => {
     res.sendStatus(200);
 });
 app.post('/api/webhook/oasyfy', async (req, res) => {
+    const sql = getDbConnection();
     const { transactionId, status } = req.body;
     if (status === 'COMPLETED') {
         try {
@@ -471,21 +536,17 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     res.sendStatus(200);
 });
 
-
-// ##################################################################
-// ### FUNÇÃO sendConversionToMeta ATUALIZADA COM HASHING DE DADOS ###
-// ##################################################################
 async function sendConversionToMeta(clickData, pixData) {
+    const sql = getDbConnection();
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
         if (presselPixels.length === 0) return;
 
         const externalId = clickData.click_id ? clickData.click_id.replace('/start ', '') : null;
         
-        // Normaliza e prepara os dados de PII
-        const city = clickData.city ? clickData.city.toLowerCase().replace(/[^a-z]/g, '') : null;
-        const state = clickData.state ? clickData.state.toLowerCase().replace(/[^a-z]/g, '') : null;
-        const gender = 'm'; // Gênero masculino, conforme solicitado
+        const city = clickData.city && clickData.city !== 'Desconhecida' ? clickData.city.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const state = clickData.state && clickData.state !== 'Desconhecido' ? clickData.state.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const gender = 'm';
 
         for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
@@ -499,13 +560,11 @@ async function sendConversionToMeta(clickData, pixData) {
                     fbc: clickData.fbc,
                     client_ip_address: clickData.ip_address,
                     client_user_agent: clickData.user_agent,
-                    // Converte os campos de PII em hash SHA256
                     ge: crypto.createHash('sha256').update(gender).digest('hex'),
                     ct: city ? crypto.createHash('sha256').update(city).digest('hex') : null,
                     st: state ? crypto.createHash('sha256').update(state).digest('hex') : null,
                 };
                 
-                // Remove chaves nulas do objeto userData para não enviar dados vazios
                 Object.keys(userData).forEach(key => (userData[key] === null) && delete userData[key]);
 
                 const payload = {
@@ -514,10 +573,7 @@ async function sendConversionToMeta(clickData, pixData) {
                         event_time: Math.floor(Date.now() / 1000),
                         event_id,
                         user_data: userData,
-                        custom_data: {
-                            currency: 'BRL',
-                            value: pixData.pix_value
-                        },
+                        custom_data: { currency: 'BRL', value: pixData.pix_value },
                     }]
                 };
                 await axios.post(`https://graph.facebook.com/v19.0/${pixel_id}/events`, payload, { params: { access_token: meta_api_token } });
@@ -529,19 +585,17 @@ async function sendConversionToMeta(clickData, pixData) {
     }
 }
 
-// --- FUNÇÃO DE CONSULTA PERIÓDICA ---
-// (A função checkPendingTransactions permanece inalterada)
 async function checkPendingTransactions() {
+    const sql = getDbConnection();
     console.log('Iniciando verificação de transações pendentes...');
     try {
         const pendingTransactions = await sql`
             SELECT id, provider, provider_transaction_id, click_id_internal
             FROM pix_transactions
-            WHERE status = 'pending' AND created_at > NOW() - INTERVAL '24 hours'
-        `;
+            WHERE status = 'pending' AND created_at > NOW() - INTERVAL '24 hours'`;
 
         if (pendingTransactions.length === 0) {
-            console.log('Nenhuma transação pendente para verificar. Encerrando.');
+            console.log('Nenhuma transação pendente para verificar.');
             return;
         }
 
@@ -553,8 +607,7 @@ async function checkPendingTransactions() {
                     SELECT pushinpay_token, cnpay_public_key, cnpay_secret_key, oasyfy_public_key, oasyfy_secret_key
                     FROM sellers s
                     JOIN clicks c ON c.seller_id = s.id
-                    WHERE c.id = ${tx.click_id_internal}
-                `;
+                    WHERE c.id = ${tx.click_id_internal}`;
                 if (!seller) {
                     console.error(`Seller não encontrado para a transação ${tx.id}. Pulando.`);
                     continue;
@@ -574,11 +627,9 @@ async function checkPendingTransactions() {
 
                 if (providerStatus === 'paid' || providerStatus === 'COMPLETED') {
                     const [updatedTx] = await sql`
-                        UPDATE pix_transactions
-                        SET status = 'paid', paid_at = NOW()
+                        UPDATE pix_transactions SET status = 'paid', paid_at = NOW()
                         WHERE id = ${tx.id} AND status != 'paid'
-                        RETURNING *
-                    `;
+                        RETURNING *`;
                     
                     if (updatedTx) {
                         const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
@@ -599,7 +650,6 @@ async function checkPendingTransactions() {
 setInterval(checkPendingTransactions, 120000);
 
 // --- ROTAS DO PAINEL ADMINISTRATIVO ---
-// (As rotas do admin permanecem inalteradas)
 function authenticateAdmin(req, res, next) {
     const adminKey = req.headers['x-admin-api-key'];
     if (!adminKey || adminKey !== ADMIN_API_KEY) {
@@ -607,16 +657,16 @@ function authenticateAdmin(req, res, next) {
     }
     next();
 }
+
 app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const totalSellers = await sql`SELECT COUNT(*) FROM sellers;`;
         const paidTransactions = await sql`SELECT COUNT(*) as count, SUM(pix_value) as total_revenue FROM pix_transactions WHERE status = 'paid';`;
-
         const total_sellers = parseInt(totalSellers[0].count);
         const total_paid_transactions = parseInt(paidTransactions[0].count);
         const total_revenue = parseFloat(paidTransactions[0].total_revenue || 0);
-        const saas_profit = total_revenue * 0.0299; // Sua comissão
-
+        const saas_profit = total_revenue * 0.0299;
         res.json({
             total_sellers,
             total_paid_transactions,
@@ -628,27 +678,29 @@ app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' });
     }
 });
+
+// ... (Restante das rotas de admin, todas usando `const sql = getDbConnection();` no início)
+
 app.get('/api/admin/ranking', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const ranking = await sql`
-            SELECT
-                s.id, s.name, s.email,
-                COUNT(pt.id) AS total_sales,
-                COALESCE(SUM(pt.pix_value), 0) AS total_revenue
+            SELECT s.id, s.name, s.email, COUNT(pt.id) AS total_sales, COALESCE(SUM(pt.pix_value), 0) AS total_revenue
             FROM sellers s
             LEFT JOIN clicks c ON s.id = c.seller_id
             LEFT JOIN pix_transactions pt ON c.id = pt.click_id_internal AND pt.status = 'paid'
             GROUP BY s.id, s.name, s.email
             ORDER BY total_revenue DESC
-            LIMIT 20;
-        `;
+            LIMIT 20;`;
         res.json(ranking);
     } catch (error) {
         console.error("Erro no ranking de sellers:", error);
         res.status(500).json({ message: 'Erro ao buscar ranking.' });
     }
 });
+
 app.get('/api/admin/sellers', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const sellers = await sql`SELECT id, name, email, created_at, is_active FROM sellers ORDER BY created_at DESC;`;
         res.json(sellers);
@@ -656,7 +708,9 @@ app.get('/api/admin/sellers', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao listar vendedores.' });
     }
 });
+
 app.post('/api/admin/sellers/:id/toggle-active', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     const { id } = req.params;
     const { isActive } = req.body;
     try {
@@ -666,7 +720,9 @@ app.post('/api/admin/sellers/:id/toggle-active', authenticateAdmin, async (req, 
         res.status(500).json({ message: 'Erro ao alterar status do usuário.' });
     }
 });
+
 app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     const { id } = req.params;
     const { newPassword } = req.body;
     if (!newPassword || newPassword.length < 8) {
@@ -680,40 +736,36 @@ app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) =
         res.status(500).json({ message: 'Erro ao alterar senha.' });
     }
 });
+
 app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     const { id } = req.params;
-    const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body; // adicione outras chaves se precisar
+    const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body;
     try {
         await sql`
             UPDATE sellers 
-            SET 
-                pushinpay_token = ${pushinpay_token},
-                cnpay_public_key = ${cnpay_public_key},
-                cnpay_secret_key = ${cnpay_secret_key}
-                -- adicione outras chaves aqui
-            WHERE id = ${id};
-        `;
+            SET pushinpay_token = ${pushinpay_token}, cnpay_public_key = ${cnpay_public_key}, cnpay_secret_key = ${cnpay_secret_key}
+            WHERE id = ${id};`;
         res.status(200).json({ message: 'Credenciais alteradas com sucesso.' });
     } catch (error) {
         res.status(500).json({ message: 'Erro ao alterar credenciais.' });
     }
 });
+
 app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
+    const sql = getDbConnection();
     try {
         const page = parseInt(req.query.page || 1);
         const limit = parseInt(req.query.limit || 20);
         const offset = (page - 1) * limit;
 
         const transactions = await sql`
-            SELECT
-                pt.id, pt.status, pt.pix_value, pt.provider, pt.created_at,
-                s.name as seller_name, s.email as seller_email
+            SELECT pt.id, pt.status, pt.pix_value, pt.provider, pt.created_at, s.name as seller_name, s.email as seller_email
             FROM pix_transactions pt
             JOIN clicks c ON pt.click_id_internal = c.id
             JOIN sellers s ON c.seller_id = s.id
             ORDER BY pt.created_at DESC
-            LIMIT ${limit} OFFSET ${offset};
-        `;
+            LIMIT ${limit} OFFSET ${offset};`;
          const totalTransactionsResult = await sql`SELECT COUNT(*) FROM pix_transactions;`;
          const total = parseInt(totalTransactionsResult[0].count);
 
@@ -729,6 +781,7 @@ app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar transações.' });
     }
 });
+
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
