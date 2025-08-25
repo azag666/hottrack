@@ -5,7 +5,8 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
-const path = require('path'); // Adicionado para servir o HTML
+const path = require('path');
+const crypto = require('crypto'); // Biblioteca para criptografia
 
 const app = express();
 app.use(cors());
@@ -17,7 +18,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto';
 const PUSHINPAY_SPLIT_ACCOUNT_ID = process.env.PUSHINPAY_SPLIT_ACCOUNT_ID;
 const CNPAY_SPLIT_PRODUCER_ID = process.env.CNPAY_SPLIT_PRODUCER_ID;
 const OASYFY_SPLIT_PRODUCER_ID = process.env.OASYFY_SPLIT_PRODUCER_ID;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY; // Chave secreta para o painel admin
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 
 // --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
@@ -52,15 +53,11 @@ app.post('/api/sellers/login', async (req, res) => {
         const sellerResult = await sql`SELECT * FROM sellers WHERE email = ${email}`;
         if (sellerResult.length === 0) return res.status(404).json({ message: 'Usuário não encontrado.' });
         const seller = sellerResult[0];
-
-        // LÓGICA ATUALIZADA: Verifica se o usuário está ativo
         if (!seller.is_active) {
             return res.status(403).json({ message: 'Este usuário está bloqueado.' });
         }
-        
         const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
         if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
-        
         const tokenPayload = { id: seller.id, email: seller.email };
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
         const { password_hash, ...sellerData } = seller;
@@ -87,6 +84,7 @@ app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERENCIAMENTO (CRUD) ---
+// (As rotas CRUD permanecem inalteradas)
 app.post('/api/pixels', authenticateJwt, async (req, res) => {
     const { account_name, pixel_id, meta_api_token } = req.body;
     if (!account_name || !pixel_id || !meta_api_token) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
@@ -144,6 +142,7 @@ app.post('/api/settings/pix', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTA DE RASTREAMENTO E CONSULTAS ---
+// (As rotas /api/registerClick e /api/click/info permanecem inalteradas)
 app.post('/api/registerClick', async (req, res) => {
     const { sellerApiKey, presselId, referer, fbclid, fbp, fbc, user_agent } = req.body;
     if (!sellerApiKey || !presselId) return res.status(400).json({ message: 'Dados insuficientes.' });
@@ -180,6 +179,7 @@ app.post('/api/click/info', async (req, res) => {
 });
 
 // --- ROTAS DE DASHBOARD E TRANSAÇÕES ---
+// (As rotas de dashboard e transações permanecem inalteradas)
 app.get('/api/dashboard/metrics', authenticateJwt, async (req, res) => {
     try {
         const sellerId = req.user.id;
@@ -272,6 +272,7 @@ app.get('/api/transactions', authenticateJwt, async (req, res) => {
 });
 
 // --- ROTAS DE GERAÇÃO E CONSULTA DE PIX ---
+// (As rotas de PIX permanecem inalteradas)
 app.post('/api/pix/generate', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const { click_id, value_cents } = req.body;
@@ -429,6 +430,7 @@ app.post('/api/pix/check-status', async (req, res) => {
 });
 
 // --- WEBHOOKS ---
+// (As rotas de webhook permanecem inalteradas)
 app.post('/api/webhook/pushinpay', async (req, res) => {
     const { id, status } = req.body;
     if (status === 'paid') {
@@ -469,18 +471,21 @@ app.post('/api/webhook/oasyfy', async (req, res) => {
     res.sendStatus(200);
 });
 
+
+// ##################################################################
+// ### FUNÇÃO sendConversionToMeta ATUALIZADA COM HASHING DE DADOS ###
+// ##################################################################
 async function sendConversionToMeta(clickData, pixData) {
     try {
         const presselPixels = await sql`SELECT pixel_config_id FROM pressel_pixels WHERE pressel_id = ${clickData.pressel_id}`;
         if (presselPixels.length === 0) return;
 
-        // Limpa o click_id para ser usado como external_id
         const externalId = clickData.click_id ? clickData.click_id.replace('/start ', '') : null;
         
-        // Prepara os dados de geolocalização e gênero
-        const city = clickData.city ? clickData.city.toLowerCase().replace(/\s/g, '') : null;
-        const state = clickData.state ? clickData.state.toLowerCase().replace(/\s/g, '') : null;
-
+        // Normaliza e prepara os dados de PII
+        const city = clickData.city ? clickData.city.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const state = clickData.state ? clickData.state.toLowerCase().replace(/[^a-z]/g, '') : null;
+        const gender = 'm'; // Gênero masculino, conforme solicitado
 
         for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
@@ -494,13 +499,14 @@ async function sendConversionToMeta(clickData, pixData) {
                     fbc: clickData.fbc,
                     client_ip_address: clickData.ip_address,
                     client_user_agent: clickData.user_agent,
-                    ge: 'm', // Gênero masculino
-                    ct: city, // Cidade
-                    st: state, // Estado
+                    // Converte os campos de PII em hash SHA256
+                    ge: crypto.createHash('sha256').update(gender).digest('hex'),
+                    ct: city ? crypto.createHash('sha256').update(city).digest('hex') : null,
+                    st: state ? crypto.createHash('sha256').update(state).digest('hex') : null,
                 };
                 
                 // Remove chaves nulas do objeto userData para não enviar dados vazios
-                Object.keys(userData).forEach(key => userData[key] === null && delete userData[key]);
+                Object.keys(userData).forEach(key => (userData[key] === null) && delete userData[key]);
 
                 const payload = {
                     data: [{
@@ -519,12 +525,12 @@ async function sendConversionToMeta(clickData, pixData) {
             }
         }
     } catch (error) {
-        console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message);
+        console.error('Erro ao enviar conversão para a Meta:', error.response?.data || error.message);
     }
 }
 
-
 // --- FUNÇÃO DE CONSULTA PERIÓDICA ---
+// (A função checkPendingTransactions permanece inalterada)
 async function checkPendingTransactions() {
     console.log('Iniciando verificação de transações pendentes...');
     try {
@@ -590,16 +596,10 @@ async function checkPendingTransactions() {
         console.log('Verificação de transações concluída.');
     }
 }
-
-// Inicia a rotina de verificação (reduzi para 2 minutos como teste, pode ajustar)
 setInterval(checkPendingTransactions, 120000);
 
-
-// ######################################################################
-// ### INÍCIO DAS ROTAS DO PAINEL ADMINISTRATIVO                      ###
-// ######################################################################
-
-// Middleware para autenticação do Admin
+// --- ROTAS DO PAINEL ADMINISTRATIVO ---
+// (As rotas do admin permanecem inalteradas)
 function authenticateAdmin(req, res, next) {
     const adminKey = req.headers['x-admin-api-key'];
     if (!adminKey || adminKey !== ADMIN_API_KEY) {
@@ -607,8 +607,6 @@ function authenticateAdmin(req, res, next) {
     }
     next();
 }
-
-// Rota para o dashboard do admin com métricas globais
 app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
     try {
         const totalSellers = await sql`SELECT COUNT(*) FROM sellers;`;
@@ -630,8 +628,6 @@ app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' });
     }
 });
-
-// Rota para o ranking de sellers
 app.get('/api/admin/ranking', authenticateAdmin, async (req, res) => {
     try {
         const ranking = await sql`
@@ -652,8 +648,6 @@ app.get('/api/admin/ranking', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar ranking.' });
     }
 });
-
-// Rota para listar todos os sellers
 app.get('/api/admin/sellers', authenticateAdmin, async (req, res) => {
     try {
         const sellers = await sql`SELECT id, name, email, created_at, is_active FROM sellers ORDER BY created_at DESC;`;
@@ -662,8 +656,6 @@ app.get('/api/admin/sellers', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao listar vendedores.' });
     }
 });
-
-// Rota para bloquear/desbloquear um seller
 app.post('/api/admin/sellers/:id/toggle-active', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     const { isActive } = req.body;
@@ -674,8 +666,6 @@ app.post('/api/admin/sellers/:id/toggle-active', authenticateAdmin, async (req, 
         res.status(500).json({ message: 'Erro ao alterar status do usuário.' });
     }
 });
-
-// Rota para alterar a senha de um seller
 app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     const { newPassword } = req.body;
@@ -690,8 +680,6 @@ app.put('/api/admin/sellers/:id/password', authenticateAdmin, async (req, res) =
         res.status(500).json({ message: 'Erro ao alterar senha.' });
     }
 });
-
-// Rota para alterar credenciais de um seller
 app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     const { pushinpay_token, cnpay_public_key, cnpay_secret_key } = req.body; // adicione outras chaves se precisar
@@ -710,8 +698,6 @@ app.put('/api/admin/sellers/:id/credentials', authenticateAdmin, async (req, res
         res.status(500).json({ message: 'Erro ao alterar credenciais.' });
     }
 });
-
-// Rota para listar todas as transações
 app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
     try {
         const page = parseInt(req.query.page || 1);
@@ -743,11 +729,8 @@ app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar transações.' });
     }
 });
-
-// Rota para servir o arquivo HTML do painel admin
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
-
 
 module.exports = app;
