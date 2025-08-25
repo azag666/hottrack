@@ -476,24 +476,38 @@ async function sendConversionToMeta(clickData, pixData) {
 
         // Limpa o click_id para ser usado como external_id
         const externalId = clickData.click_id ? clickData.click_id.replace('/start ', '') : null;
+        
+        // Prepara os dados de geolocalização e gênero
+        const city = clickData.city ? clickData.city.toLowerCase().replace(/\s/g, '') : null;
+        const state = clickData.state ? clickData.state.toLowerCase().replace(/\s/g, '') : null;
+
 
         for (const { pixel_config_id } of presselPixels) {
             const [pixelConfig] = await sql`SELECT pixel_id, meta_api_token FROM pixel_configurations WHERE id = ${pixel_config_id}`;
             if (pixelConfig) {
                 const { pixel_id, meta_api_token } = pixelConfig;
                 const event_id = `pix.${pixData.id}.${pixel_id}`;
+                
+                const userData = {
+                    external_id: externalId,
+                    fbp: clickData.fbp,
+                    fbc: clickData.fbc,
+                    client_ip_address: clickData.ip_address,
+                    client_user_agent: clickData.user_agent,
+                    ge: 'm', // Gênero masculino
+                    ct: city, // Cidade
+                    st: state, // Estado
+                };
+                
+                // Remove chaves nulas do objeto userData para não enviar dados vazios
+                Object.keys(userData).forEach(key => userData[key] === null && delete userData[key]);
+
                 const payload = {
                     data: [{
                         event_name: 'Purchase',
                         event_time: Math.floor(Date.now() / 1000),
                         event_id,
-                        user_data: {
-                            external_id: externalId, // ID Externo adicionado aqui
-                            fbp: clickData.fbp,
-                            fbc: clickData.fbc,
-                            client_ip_address: clickData.ip_address,
-                            client_user_agent: clickData.user_agent
-                        },
+                        user_data: userData,
                         custom_data: {
                             currency: 'BRL',
                             value: pixData.pix_value
@@ -508,6 +522,7 @@ async function sendConversionToMeta(clickData, pixData) {
         console.error('Erro ao enviar conversão para a Meta:', error.response?.data?.error || error.message);
     }
 }
+
 
 // --- FUNÇÃO DE CONSULTA PERIÓDICA ---
 async function checkPendingTransactions() {
