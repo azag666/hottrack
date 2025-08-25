@@ -13,8 +13,6 @@ app.use(cors());
 app.use(express.json());
 
 // --- FUNÇÃO PARA OBTER CONEXÃO COM O BANCO ---
-// Em vez de uma conexão global, chamaremos esta função em cada rota
-// para garantir um gerenciamento de conexão eficiente no ambiente serverless.
 function getDbConnection() {
     return neon(process.env.DATABASE_URL);
 }
@@ -494,10 +492,10 @@ app.post('/api/pix/check-status', async (req, res) => {
 
 // --- WEBHOOKS ---
 app.post('/api/webhook/pushinpay', async (req, res) => {
-    const sql = getDbConnection();
     const { id, status } = req.body;
     if (status === 'paid') {
         try {
+            const sql = getDbConnection();
             const [updatedTx] = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE provider_transaction_id = ${id} AND provider = 'pushinpay' AND status != 'paid' RETURNING *`;
             if (updatedTx) {
                 const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
@@ -508,10 +506,10 @@ app.post('/api/webhook/pushinpay', async (req, res) => {
     res.sendStatus(200);
 });
 app.post('/api/webhook/cnpay', async (req, res) => {
-    const sql = getDbConnection();
     const { transactionId, status } = req.body;
     if (status === 'COMPLETED') {
         try {
+            const sql = getDbConnection();
             const [updatedTx] = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE provider_transaction_id = ${transactionId} AND provider = 'cnpay' AND status != 'paid' RETURNING *`;
             if (updatedTx) {
                 const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
@@ -522,10 +520,10 @@ app.post('/api/webhook/cnpay', async (req, res) => {
     res.sendStatus(200);
 });
 app.post('/api/webhook/oasyfy', async (req, res) => {
-    const sql = getDbConnection();
     const { transactionId, status } = req.body;
     if (status === 'COMPLETED') {
         try {
+            const sql = getDbConnection();
             const [updatedTx] = await sql`UPDATE pix_transactions SET status = 'paid', paid_at = NOW() WHERE provider_transaction_id = ${transactionId} AND provider = 'oasyfy' AND status != 'paid' RETURNING *`;
             if (updatedTx) {
                 const [click] = await sql`SELECT * FROM clicks WHERE id = ${updatedTx.click_id_internal}`;
@@ -678,8 +676,6 @@ app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
         res.status(500).json({ message: 'Erro ao buscar dados do dashboard.' });
     }
 });
-
-// ... (Restante das rotas de admin, todas usando `const sql = getDbConnection();` no início)
 
 app.get('/api/admin/ranking', authenticateAdmin, async (req, res) => {
     const sql = getDbConnection();
