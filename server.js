@@ -48,7 +48,6 @@ async function sendTelegramRequest(botToken, method, data) {
     }
 }
 
-// CORREÇÃO: Função sendTypingAction para ser robusta contra erros de rede (ECONNRESET)
 async function sendTypingAction(chatId, botToken) {
     try {
         await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
@@ -92,17 +91,24 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     let currentNodeId = startNodeId;
     let variables = { ...initialVariables };
+    let userState; // Move declaration outside try/catch
 
-    const [savedState] = await sql`SELECT variables FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
-    if (savedState) {
-        variables = { ...savedState.variables, ...variables };
+    [userState] = await sql`SELECT * FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+    if (userState) {
+        variables = { ...userState.variables, ...variables };
     }
 
 
     if (!currentNodeId) {
-        const [userState] = await sql`SELECT * FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+        // userState já foi buscado acima
         if (userState && userState.waiting_for_input) {
-            console.log(`[Flow Engine] Usuário ${chatId} respondeu. Continuando do nó ${userState.current_node_id} pelo caminho 'com resposta'.`);
+            console.log(`[Flow Engine] USUÁRIO RESPONDEU. PROSSEGUINDO INSTANTANEAMENTE.`);
+            
+            // CORREÇÃO: Limpa o estado de espera imediatamente ao detectar a resposta
+            // Isso previne que o Cron Job processe o timeout
+            await sql`DELETE FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`; 
+
+            // Continua do nó onde a espera foi setada, usando o caminho 'Com Resp.' ('a')
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
         } else {
             console.log(`[Flow Engine] Iniciando novo fluxo para ${chatId} a partir do gatilho.`);
@@ -127,11 +133,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             break;
         }
 
+        // Se o estado não foi limpo acima (i.e., é um novo estado de espera ou um avanço do cron job),
+        // ele é criado/atualizado aqui.
         await sql`
             INSERT INTO user_flow_states (chat_id, bot_id, current_node_id, variables, waiting_for_input)
-            VALUES (${chatId}, ${botId}, ${currentNodeId}, ${JSON.stringify(variables)}, false)
+            VALUES (${chatId}, ${botId}, ${currentNodeId}, ${JSON.stringify(variables)}, FALSE)
             ON CONFLICT (chat_id, bot_id)
-            DO UPDATE SET current_node_id = EXCLUDED.current_node_id, variables = EXCLUDED.variables, waiting_for_input = false;
+            DO UPDATE SET current_node_id = EXCLUDED.current_node_id, variables = EXCLUDED.variables, waiting_for_input = FALSE;
         `;
 
         const nodeData = currentNode.data || {};
@@ -140,7 +148,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'message': {
                 const textToSend = await replaceVariables(nodeData.text, variables);
                 if (nodeData.showTyping) {
-                    await sendTypingAction(chatId, botToken); // Ação robusta agora
+                    await sendTypingAction(chatId, botToken); 
                     let typingDuration = textToSend.length * 50;
                     typingDuration = Math.max(500, Math.min(2000, typingDuration));
                     await new Promise(resolve => setTimeout(resolve, typingDuration));
@@ -149,7 +157,8 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 if (nodeData.waitForReply) {
-                    await sql`UPDATE user_flow_states SET waiting_for_input = true WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                    // Se estiver aguardando resposta, ATUALIZA o estado para TRUE e AGENDA o timeout
+                    await sql`UPDATE user_flow_states SET waiting_for_input = TRUE WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
@@ -159,8 +168,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                             VALUES (${chatId}, ${botId}, NOW() + INTERVAL '${timeoutMinutes} minutes', ${noReplyNodeId}, ${JSON.stringify(variables)})
                         `;
                     }
-                    currentNodeId = null;
+                    currentNodeId = null; // Para o fluxo aqui e espera pela resposta/cron
                 } else {
+                    // Se não estiver aguardando, avança para o próximo nó ('a')
                     currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 }
                 break;
@@ -595,6 +605,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         const chatId = message?.chat?.id;
         if (!chatId || !message.text) return;
         
+        // 1. Limpa timeouts agendados. Isso é crucial para cancelar a corrida do Cron Job
         await sql`DELETE FROM flow_timeouts WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
 
         const [bot] = await sql`SELECT seller_id, bot_token FROM telegram_bots WHERE id = ${botId}`;
@@ -604,7 +615,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         
         let initialVars = {};
         if (message.text.startsWith('/start ')) {
-            // CORREÇÃO: Armazena a string COMPLETA no banco de dados.
+            // Armazena a string COMPLETA no banco de dados.
             const fullClickId = message.text; 
             
             // Para o processamento de fluxo, usamos apenas o parâmetro (sem "/start ")
@@ -618,6 +629,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             `;
         }
         
+        // 2. Processa o fluxo. O processFlow agora sabe como limpar o estado de 'espera'.
         await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars);
 
     } catch (error) {
