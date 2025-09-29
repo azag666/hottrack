@@ -15,6 +15,29 @@ app.use(express.json());
 
 const sql = neon(process.env.DATABASE_URL);
 
+// ==========================================================
+//          NOVO: LÓGICA DE RETRY PARA O BANCO DE DADOS
+// ==========================================================
+async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            // Usando tagged template literal com parâmetros
+            return await sql(query, ...params);
+        } catch (error) {
+            // Verifica se é um erro de conexão que pode ser tentado novamente
+            const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
+            if (isRetryable && i < retries - 1) {
+                console.warn(`[DB RETRY] Erro de conexão com o banco de dados. Tentando novamente em ${delay}ms... (Tentativa ${i + 1}/${retries})`);
+                await new Promise(res => setTimeout(res, delay));
+            } else {
+                console.error("[DB FATAL] Erro final ao executar a query:", error);
+                throw error; // Lança o erro final se não for recuperável ou se as tentativas acabaram
+            }
+        }
+    }
+}
+
+
 // --- MIDDLEWARE DE AUTENTICAÇÃO (COMPARTILHADO) ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
@@ -52,7 +75,6 @@ async function sendTypingAction(chatId, botToken) {
     try {
         await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
     } catch (error) {
-        // Silencia o erro para que a ação secundária não pare o fluxo principal
         console.warn(`[TELEGRAM API WARN] Falha ao enviar ação 'typing' para ${chatId}. Continuando o fluxo.`);
     }
 }
@@ -61,11 +83,13 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text } = message;
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
 
-    await sql`
+    const query = `
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type)
-        VALUES (${sellerId}, ${botId}, ${chat.id}, ${message_id}, ${from.id}, ${from.first_name || botInfo.first_name}, ${from.last_name || botInfo.last_name}, ${from.username || null}, ${text}, ${senderType})
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (chat_id, message_id) DO NOTHING;
     `;
+    const params = [sellerId, botId, chat.id, message_id, from.id, from.first_name || botInfo.first_name, from.last_name || botInfo.last_name, from.username || null, text, senderType];
+    await sqlWithRetry(query, params);
 }
 
 async function replaceVariables(text, variables) {
@@ -80,7 +104,7 @@ async function replaceVariables(text, variables) {
 
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}) {
     console.log(`[Flow Engine] Iniciando processo para ${chatId}. Nó inicial: ${startNodeId || 'Padrão'}`);
-    const [flow] = await sql`SELECT * FROM flows WHERE bot_id = ${botId} ORDER BY updated_at DESC LIMIT 1`;
+    const [flow] = await sqlWithRetry(`SELECT * FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1`, [botId]);
     if (!flow || !flow.nodes) {
         console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
         return;
@@ -91,24 +115,17 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     let currentNodeId = startNodeId;
     let variables = { ...initialVariables };
-    let userState; // Move declaration outside try/catch
+    let userState;
 
-    [userState] = await sql`SELECT * FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+    [userState] = await sqlWithRetry(`SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
     if (userState) {
         variables = { ...userState.variables, ...variables };
     }
 
-
     if (!currentNodeId) {
-        // userState já foi buscado acima
         if (userState && userState.waiting_for_input) {
             console.log(`[Flow Engine] USUÁRIO RESPONDEU. PROSSEGUINDO INSTANTANEAMENTE.`);
-            
-            // CORREÇÃO: Limpa o estado de espera imediatamente ao detectar a resposta
-            // Isso previne que o Cron Job processe o timeout
-            await sql`DELETE FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`; 
-
-            // Continua do nó onde a espera foi setada, usando o caminho 'Com Resp.' ('a')
+            await sqlWithRetry(`DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
         } else {
             console.log(`[Flow Engine] Iniciando novo fluxo para ${chatId} a partir do gatilho.`);
@@ -121,7 +138,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     if (!currentNodeId) {
         console.log(`[Flow Engine] Fim do fluxo ou nenhum nó inicial encontrado para ${chatId}.`);
-        await sql`DELETE FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+        await sqlWithRetry(`DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
         return;
     }
 
@@ -133,14 +150,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             break;
         }
 
-        // Se o estado não foi limpo acima (i.e., é um novo estado de espera ou um avanço do cron job),
-        // ele é criado/atualizado aqui.
-        await sql`
+        const queryInsertState = `
             INSERT INTO user_flow_states (chat_id, bot_id, current_node_id, variables, waiting_for_input)
-            VALUES (${chatId}, ${botId}, ${currentNodeId}, ${JSON.stringify(variables)}, FALSE)
+            VALUES ($1, $2, $3, $4, FALSE)
             ON CONFLICT (chat_id, bot_id)
             DO UPDATE SET current_node_id = EXCLUDED.current_node_id, variables = EXCLUDED.variables, waiting_for_input = FALSE;
         `;
+        await sqlWithRetry(queryInsertState, [chatId, botId, currentNodeId, JSON.stringify(variables)]);
 
         const nodeData = currentNode.data || {};
 
@@ -148,7 +164,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'message': {
                 const textToSend = await replaceVariables(nodeData.text, variables);
                 if (nodeData.showTyping) {
-                    await sendTypingAction(chatId, botToken); 
+                    await sendTypingAction(chatId, botToken);
                     let typingDuration = textToSend.length * 50;
                     typingDuration = Math.max(500, Math.min(2000, typingDuration));
                     await new Promise(resolve => setTimeout(resolve, typingDuration));
@@ -157,25 +173,24 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 if (nodeData.waitForReply) {
-                    // Se estiver aguardando resposta, ATUALIZA o estado para TRUE e AGENDA o timeout
-                    await sql`UPDATE user_flow_states SET waiting_for_input = TRUE WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                    await sqlWithRetry(`UPDATE user_flow_states SET waiting_for_input = TRUE WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
                         console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
-                        await sql`
+                        const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
-                            VALUES (${chatId}, ${botId}, NOW() + INTERVAL '${timeoutMinutes} minutes', ${noReplyNodeId}, ${JSON.stringify(variables)})
+                            VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)
                         `;
+                        await sqlWithRetry(queryTimeout, [chatId, botId, noReplyNodeId, JSON.stringify(variables)]);
                     }
-                    currentNodeId = null; // Para o fluxo aqui e espera pela resposta/cron
+                    currentNodeId = null;
                 } else {
-                    // Se não estiver aguardando, avança para o próximo nó ('a')
                     currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 }
                 break;
             }
-
+            // ... (o restante dos cases do switch permanece o mesmo)
             case 'image':
             case 'video':
             case 'audio': {
@@ -213,7 +228,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     if (!click_id) throw new Error("Click ID não encontrado nas variáveis do fluxo para gerar PIX.");
                     
                     const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/pix/generate';
-                    const [seller] = await sql`SELECT api_key FROM sellers WHERE id = ${sellerId}`;
+                    const [seller] = await sqlWithRetry(`SELECT api_key FROM sellers WHERE id = $1`, [sellerId]);
                     if (!seller) throw new Error("API Key do vendedor não encontrada.");
 
                     const response = await axios.post(hottrackApiUrl, 
@@ -224,7 +239,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const pixResult = response.data;
                     variables.last_transaction_id = pixResult.transaction_id;
                     
-                    await sql`UPDATE user_flow_states SET variables = ${JSON.stringify(variables)} WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                    await sqlWithRetry(`UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3`, [JSON.stringify(variables), chatId, botId]);
                     
                     const textToSend = `Pix copia e cola gerado:\n\n\`${pixResult.qr_code_text}\``;
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'Markdown' });
@@ -245,7 +260,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     if (!transactionId) throw new Error("Nenhum ID de transação PIX encontrado para consultar.");
 
                     const hottrackApiUrl = `https://novaapi-one.vercel.app/api/pix/status/${transactionId}`;
-                    const [seller] = await sql`SELECT api_key FROM sellers WHERE id = ${sellerId}`;
+                    const [seller] = await sqlWithRetry(`SELECT api_key FROM sellers WHERE id = $1`, [sellerId]);
                     if (!seller) throw new Error("API Key do vendedor não encontrada.");
 
                     const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.api_key } });
@@ -274,7 +289,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     if (!click_id) throw new Error("Click ID não encontrado para consultar cidade.");
 
                     const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/click/info';
-                    const [seller] = await sql`SELECT api_key FROM sellers WHERE id = ${sellerId}`;
+                    const [seller] = await sqlWithRetry(`SELECT api_key FROM sellers WHERE id = $1`, [sellerId]);
                      if (!seller) throw new Error("API Key do vendedor não encontrada.");
 
                     const response = await axios.post(hottrackApiUrl, { click_id }, { headers: { 'x-api-key': seller.api_key } });
@@ -282,7 +297,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     variables.city = response.data.city || 'Desconhecida';
                     variables.state = response.data.state || 'Desconhecido';
                     
-                    await sql`UPDATE user_flow_states SET variables = ${JSON.stringify(variables)} WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                    await sqlWithRetry(`UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3`, [JSON.stringify(variables), chatId, botId]);
 
                 } catch(error) {
                     console.error("[Flow Engine] Erro ao consultar cidade:", error.response?.data || error.message);
@@ -296,10 +311,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'forward_flow': {
                 const targetFlowId = nodeData.targetFlowId;
                 console.log(`[Flow Engine] Encaminhando ${chatId} para o fluxo ID ${targetFlowId}`);
-                const [targetFlow] = await sql`SELECT * FROM flows WHERE id = ${targetFlowId} AND bot_id = ${botId}`;
+                const [targetFlow] = await sqlWithRetry(`SELECT * FROM flows WHERE id = $1 AND bot_id = $2`, [targetFlowId, botId]);
                 
                 if (targetFlow) {
-                    await sql`DELETE FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                    await sqlWithRetry(`DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
                     
                     const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
                     const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
@@ -320,9 +335,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         }
 
         if (!currentNodeId) {
-            const pendingTimeouts = await sql`SELECT 1 FROM flow_timeouts WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+            const pendingTimeouts = await sqlWithRetry(`SELECT 1 FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
             if(pendingTimeouts.length === 0){
-                 await sql`DELETE FROM user_flow_states WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+                 await sqlWithRetry(`DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
             }
         }
         safetyLock++;
@@ -336,17 +351,18 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
         return res.status(401).send('Unauthorized');
     }
     try {
-        const pendingTimeouts = await sql`SELECT * FROM flow_timeouts WHERE execute_at <= NOW()`;
+        const pendingTimeouts = await sqlWithRetry(`SELECT * FROM flow_timeouts WHERE execute_at <= NOW()`);
         if (pendingTimeouts.length > 0) {
             console.log(`[CRON] Encontrados ${pendingTimeouts.length} timeouts para processar.`);
             for (const timeout of pendingTimeouts) {
-                await sql`DELETE FROM flow_timeouts WHERE id = ${timeout.id}`;
-                const [userState] = await sql`SELECT waiting_for_input FROM user_flow_states WHERE chat_id = ${timeout.chat_id} AND bot_id = ${timeout.bot_id}`;
+                await sqlWithRetry(`DELETE FROM flow_timeouts WHERE id = $1`, [timeout.id]);
+                const [userState] = await sqlWithRetry(`SELECT waiting_for_input FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2`, [timeout.chat_id, timeout.bot_id]);
                 
                 if (userState && userState.waiting_for_input) {
-                    const [bot] = await sql`SELECT seller_id, bot_token FROM telegram_bots WHERE id = ${timeout.bot_id}`;
+                    const [bot] = await sqlWithRetry(`SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1`, [timeout.bot_id]);
                     if (bot) {
                         console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+                        // Não envolva o processFlow em retry aqui, pois ele já tem retries internos.
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, timeout.variables);
                     }
                 }
@@ -367,7 +383,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
 // --- ROTA DE DIAGNÓSTICO / HEALTH CHECK ---
 app.get('/api/health', async (req, res) => {
     try {
-        const result = await sql`SELECT 1 as status;`;
+        const result = await sqlWithRetry(`SELECT 1 as status;`);
         if (result[0]?.status === 1) {
             res.status(200).json({ status: 'ok', message: 'API está rodando e a conexão com o banco de dados foi bem-sucedida.' });
         } else {
@@ -388,12 +404,12 @@ app.post('/api/sellers/register', async (req, res) => {
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
     try {
         const normalizedEmail = email.trim().toLowerCase();
-        const existingSeller = await sql`SELECT id FROM sellers WHERE LOWER(email) = ${normalizedEmail}`;
+        const existingSeller = await sqlWithRetry(`SELECT id FROM sellers WHERE LOWER(email) = $1`, [normalizedEmail]);
         if (existingSeller.length > 0) return res.status(409).json({ message: 'Este email já está em uso.' });
         
         const hashedPassword = await bcrypt.hash(password, 10);
         const apiKey = uuidv4();
-        await sql`INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES (${name}, ${normalizedEmail}, ${hashedPassword}, ${apiKey}, TRUE)`;
+        await sqlWithRetry(`INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES ($1, $2, $3, $4, TRUE)`, [name, normalizedEmail, hashedPassword, apiKey]);
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
@@ -403,7 +419,7 @@ app.post('/api/sellers/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
     try {
         const normalizedEmail = email.trim().toLowerCase();
-        const [seller] = await sql`SELECT id, email, password_hash, is_active FROM sellers WHERE email = ${normalizedEmail}`;
+        const [seller] = await sqlWithRetry(`SELECT id, email, password_hash, is_active FROM sellers WHERE email = $1`, [normalizedEmail]);
         if (!seller) return res.status(404).json({ message: 'Usuário não encontrado.' });
         
         if (!seller.is_active) {
@@ -423,7 +439,7 @@ app.post('/api/sellers/login', async (req, res) => {
 
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
-        const bots = await sql`SELECT * FROM telegram_bots WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
+        const bots = await sqlWithRetry(`SELECT * FROM telegram_bots WHERE seller_id = $1 ORDER BY created_at DESC`, [req.user.id]);
         res.json({ bots });
     } catch (error) {
         res.status(500).json({ message: 'Erro ao buscar dados.' });
@@ -435,9 +451,9 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
     if (!bot_name) return res.status(400).json({ message: 'O nome do bot é obrigatório.' });
     try {
         const placeholderToken = `placeholder_${uuidv4()}`;
-        const [newBot] = await sql`
+        const [newBot] = await sqlWithRetry(`
             INSERT INTO telegram_bots (seller_id, bot_name, bot_token) 
-            VALUES (${req.user.id}, ${bot_name}, ${placeholderToken}) RETURNING *;`;
+            VALUES ($1, $2, $3) RETURNING *;`, [req.user.id, bot_name, placeholderToken]);
         res.status(201).json(newBot);
     } catch (error) {
         if (error.code === '23505') return res.status(409).json({ message: 'Um bot com este nome de usuário já existe.' });
@@ -447,7 +463,7 @@ app.post('/api/bots', authenticateJwt, async (req, res) => {
 
 app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
     try {
-        await sql`DELETE FROM telegram_bots WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        await sqlWithRetry(`DELETE FROM telegram_bots WHERE id = $1 AND seller_id = $2`, [req.params.id, req.user.id]);
         res.status(204).send();
     } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
 });
@@ -456,7 +472,7 @@ app.put('/api/bots/:id', authenticateJwt, async (req, res) => {
     const { bot_token } = req.body;
     if (!bot_token) return res.status(400).json({ message: 'O token do bot é obrigatório.' });
     try {
-        await sql`UPDATE telegram_bots SET bot_token = ${bot_token.trim()} WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        await sqlWithRetry(`UPDATE telegram_bots SET bot_token = $1 WHERE id = $2 AND seller_id = $3`, [bot_token.trim(), req.params.id, req.user.id]);
         res.status(200).json({ message: 'Token do bot atualizado.' });
     } catch (error) { res.status(500).json({ message: 'Erro ao atualizar o token.' }); }
 });
@@ -464,7 +480,7 @@ app.put('/api/bots/:id', authenticateJwt, async (req, res) => {
 app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
     const { id } = req.params;
     try {
-        const [bot] = await sql`SELECT bot_token FROM telegram_bots WHERE id = ${id} AND seller_id = ${req.user.id}`;
+        const [bot] = await sqlWithRetry(`SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2`, [id, req.user.id]);
         if (!bot || !bot.bot_token) return res.status(400).json({ message: 'Token do bot não configurado.' });
         
         const webhookUrl = `https://hottrack.vercel.app/api/webhook/telegram/${id}`;
@@ -477,7 +493,7 @@ app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
 
 app.get('/api/flows', authenticateJwt, async (req, res) => {
     try {
-        const flows = await sql`SELECT * FROM flows WHERE seller_id = ${req.user.id} ORDER BY created_at DESC`;
+        const flows = await sqlWithRetry(`SELECT * FROM flows WHERE seller_id = $1 ORDER BY created_at DESC`, [req.user.id]);
         res.status(200).json(flows.map(f => ({ ...f, nodes: f.nodes || { nodes: [], edges: [] } })));
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar os fluxos.' }); }
 });
@@ -487,8 +503,8 @@ app.post('/api/flows', authenticateJwt, async (req, res) => {
     if (!name || !botId) return res.status(400).json({ message: 'Nome e ID do bot são obrigatórios.' });
     try {
         const initialFlow = { nodes: [{ id: 'start', type: 'trigger', position: { x: 250, y: 50 }, data: {} }], edges: [] };
-        const [newFlow] = await sql`
-            INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES (${req.user.id}, ${botId}, ${name}, ${JSON.stringify(initialFlow)}) RETURNING *;`;
+        const [newFlow] = await sqlWithRetry(`
+            INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES ($1, $2, $3, $4) RETURNING *;`, [req.user.id, botId, name, JSON.stringify(initialFlow)]);
         res.status(201).json(newFlow);
     } catch (error) { res.status(500).json({ message: 'Erro ao criar o fluxo.' }); }
 });
@@ -497,7 +513,7 @@ app.put('/api/flows/:id', authenticateJwt, async (req, res) => {
     const { name, nodes } = req.body;
     if (!name || !nodes) return res.status(400).json({ message: 'Nome e estrutura de nós são obrigatórios.' });
     try {
-        const [updated] = await sql`UPDATE flows SET name = ${name}, nodes = ${nodes}, updated_at = NOW() WHERE id = ${req.params.id} AND seller_id = ${req.user.id} RETURNING *;`;
+        const [updated] = await sqlWithRetry(`UPDATE flows SET name = $1, nodes = $2, updated_at = NOW() WHERE id = $3 AND seller_id = $4 RETURNING *;`, [name, nodes, req.params.id, req.user.id]);
         if (updated) res.status(200).json(updated);
         else res.status(404).json({ message: 'Fluxo não encontrado.' });
     } catch (error) { res.status(500).json({ message: 'Erro ao salvar o fluxo.' }); }
@@ -505,7 +521,7 @@ app.put('/api/flows/:id', authenticateJwt, async (req, res) => {
 
 app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
     try {
-        const result = await sql`DELETE FROM flows WHERE id = ${req.params.id} AND seller_id = ${req.user.id}`;
+        const result = await sqlWithRetry(`DELETE FROM flows WHERE id = $1 AND seller_id = $2`, [req.params.id, req.user.id]);
         if (result.count > 0) res.status(204).send();
         else res.status(404).json({ message: 'Fluxo não encontrado.' });
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar o fluxo.' }); }
@@ -513,18 +529,18 @@ app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
 
 app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     try {
-        const users = await sql`
+        const users = await sqlWithRetry(`
             SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
-            WHERE bot_id = ${req.params.botId} AND seller_id = ${req.user.id} 
-            ORDER BY chat_id, created_at DESC;`;
+            WHERE bot_id = $1 AND seller_id = $2
+            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
         res.status(200).json(users);
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
 });
 
 app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
     try {
-        const messages = await sql`
-            SELECT * FROM telegram_chats WHERE bot_id = ${req.params.botId} AND chat_id = ${req.params.chatId} AND seller_id = ${req.user.id} ORDER BY created_at ASC;`;
+        const messages = await sqlWithRetry(`
+            SELECT * FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3 ORDER BY created_at ASC;`, [req.params.botId, req.params.chatId, req.user.id]);
         res.status(200).json(messages);
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar mensagens.' }); }
 });
@@ -533,7 +549,7 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
     const { chatId, text } = req.body;
     if (!chatId || !text) return res.status(400).json({ message: 'Chat ID e texto são obrigatórios.' });
     try {
-        const [bot] = await sql`SELECT bot_token FROM telegram_bots WHERE id = ${req.params.botId} AND seller_id = ${req.user.id}`;
+        const [bot] = await sqlWithRetry(`SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2`, [req.params.botId, req.user.id]);
         if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
         
         const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text });
@@ -544,8 +560,8 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
 
 app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
     try {
-        await sql`DELETE FROM telegram_chats WHERE bot_id = ${req.params.botId} AND chat_id = ${req.params.chatId} AND seller_id = ${req.user.id}`;
-        await sql`DELETE FROM user_flow_states WHERE bot_id = ${req.params.botId} AND chat_id = ${req.params.chatId}`;
+        await sqlWithRetry(`DELETE FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3`, [req.params.botId, req.params.chatId, req.user.id]);
+        await sqlWithRetry(`DELETE FROM user_flow_states WHERE bot_id = $1 AND chat_id = $2`, [req.params.botId, req.params.chatId]);
         res.status(204).send();
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
 });
@@ -555,10 +571,10 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
     if (!botIds || !initialText || !ctaButtonText) return res.status(400).json({ message: 'Campos obrigatórios faltando.' });
     try {
-        const bots = await sql`SELECT id, bot_token FROM telegram_bots WHERE id = ANY(${botIds}) AND seller_id = ${req.user.id}`;
+        const bots = await sqlWithRetry(`SELECT id, bot_token FROM telegram_bots WHERE id = ANY($1) AND seller_id = $2`, [botIds, req.user.id]);
         if (bots.length === 0) return res.status(404).json({ message: 'Nenhum bot válido selecionado.' });
         
-        const users = await sql`SELECT DISTINCT ON (chat_id) chat_id, bot_id FROM telegram_chats WHERE bot_id = ANY(${botIds}) AND seller_id = ${req.user.id}`;
+        const users = await sqlWithRetry(`SELECT DISTINCT ON (chat_id) chat_id, bot_id FROM telegram_chats WHERE bot_id = ANY($1) AND seller_id = $2`, [botIds, req.user.id]);
         if (users.length === 0) return res.status(404).json({ message: 'Nenhum usuário encontrado.' });
 
         res.status(202).json({ message: `Disparo agendado para ${users.length} usuários.` });
@@ -605,31 +621,25 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         const chatId = message?.chat?.id;
         if (!chatId || !message.text) return;
         
-        // 1. Limpa timeouts agendados. Isso é crucial para cancelar a corrida do Cron Job
-        await sql`DELETE FROM flow_timeouts WHERE chat_id = ${chatId} AND bot_id = ${botId}`;
+        await sqlWithRetry(`DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2`, [chatId, botId]);
 
-        const [bot] = await sql`SELECT seller_id, bot_token FROM telegram_bots WHERE id = ${botId}`;
+        const [bot] = await sqlWithRetry(`SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1`, [botId]);
         if (!bot) return;
         
         await saveMessageToDb(bot.seller_id, botId, message, 'user');
         
         let initialVars = {};
         if (message.text.startsWith('/start ')) {
-            // Armazena a string COMPLETA no banco de dados.
             const fullClickId = message.text; 
-            
-            // Para o processamento de fluxo, usamos apenas o parâmetro (sem "/start ")
             initialVars.click_id = message.text.substring(7).trim();
             
-            // ATUALIZA A TABELA telegram_chats com a string COMPLETA para exibição no painel
-            await sql`
+            await sqlWithRetry(`
                 UPDATE telegram_chats 
-                SET click_id = ${fullClickId} 
-                WHERE chat_id = ${chatId} AND message_id = ${message.message_id};
-            `;
+                SET click_id = $1 
+                WHERE chat_id = $2 AND message_id = $3;
+            `, [fullClickId, chatId, message.message_id]);
         }
         
-        // 2. Processa o fluxo. O processFlow agora sabe como limpar o estado de 'espera'.
         await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars);
 
     } catch (error) {
