@@ -2,20 +2,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "server.js",
-      "use": "@vercel/node"
+      "src": "*.html",
+      "use": "@vercel/static"
     }
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "server.js"
-    }
-  ],
-  "crons": [
-    {
-      "path": "/api/cron/process-timeouts",
-      "schedule": "* * * * *"
+      "src": "/(.*)",
+      "dest": "/index.html"
     }
   ]
 }
