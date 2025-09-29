@@ -364,7 +364,8 @@ app.post('/api/sellers/register', async (req, res) => {
         
         const hashedPassword = await bcrypt.hash(password, 10);
         const apiKey = uuidv4();
-        await sql`INSERT INTO sellers (name, email, password_hash, api_key) VALUES (${name}, ${normalizedEmail}, ${hashedPassword}, ${apiKey})`;
+        // CORREÇÃO: Adicionado is_active = TRUE no momento do cadastro
+        await sql`INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES (${name}, ${normalizedEmail}, ${hashedPassword}, ${apiKey}, TRUE)`;
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
@@ -374,15 +375,24 @@ app.post('/api/sellers/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
     try {
         const normalizedEmail = email.trim().toLowerCase();
-        const [seller] = await sql`SELECT * FROM sellers WHERE email = ${normalizedEmail}`;
+        // CORREÇÃO: Incluído o campo `is_active` na consulta
+        const [seller] = await sql`SELECT id, email, password_hash, is_active FROM sellers WHERE email = ${normalizedEmail}`;
         if (!seller) return res.status(404).json({ message: 'Usuário não encontrado.' });
         
+        // CORREÇÃO: Adicionada verificação se o usuário está ativo
+        if (!seller.is_active) {
+            return res.status(403).json({ message: 'Este usuário está bloqueado.' });
+        }
+
         const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
         if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
         
         const token = jwt.sign({ id: seller.id, email: seller.email }, process.env.JWT_SECRET, { expiresIn: '1d' });
         res.status(200).json({ token });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) { 
+        console.error("Erro no login:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' }); 
+    }
 });
 
 // --- ROTAS DE GERENCIAMENTO DE BOTS, FLUXOS, CHAT, ETC. ---
@@ -594,3 +604,4 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
 
 
 module.exports = app;
+
