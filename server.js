@@ -105,28 +105,25 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
     let flowData;
     let variables = { ...initialVariables };
 
-    // CORREÇÃO: Lógica unificada para carregar os dados do fluxo
     if (variables.flow_data) {
-        // Cenário 1: O Cron Job rodou, usa os dados do fluxo "congelados"
-        flowData = variables.flow_data;
-        delete variables.flow_data; // Limpa para não poluir o estado
+        flowData = typeof variables.flow_data === 'string' 
+            ? JSON.parse(variables.flow_data) 
+            : variables.flow_data;
+        delete variables.flow_data;
     } else {
-        // Cenário 2: Fluxo normal, busca a versão mais recente no banco
-        const flowResult = await sqlWithRetry('SELECT * FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
-        const flow = flowResult[0];
-        if (!flow || !flow.nodes) {
+        const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
+        if (!flowResult || flowResult.length === 0 || !flowResult[0].nodes) {
             console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
             return;
         }
-        flowData = typeof flow.nodes === 'string' ? JSON.parse(flow.nodes) : flow.nodes;
+        flowData = JSON.parse(flowResult[0].nodes);
     }
 
     const { nodes = [], edges = [] } = flowData;
-
     let currentNodeId = startNodeId;
-    let userState;
+
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-    userState = userStateResult[0];
+    const userState = userStateResult[0];
 
     if (userState) {
         variables = { ...userState.variables, ...variables };
@@ -148,7 +145,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     if (!currentNodeId) {
         console.log(`[Flow Engine] Fim do fluxo ou nenhum nó inicial encontrado para ${chatId}.`);
-        if (userState) { // Apenas deleta se o estado existir
+        if (userState) {
             await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
         }
         return;
@@ -190,9 +187,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
                         console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
-                        
                         const variablesWithFlow = { ...variables, flow_data: flowData };
-                        
                         const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
                             VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)
@@ -206,7 +201,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
             
-            // ... (o restante dos cases do switch permanece o mesmo)
             case 'image':
             case 'video':
             case 'audio': {
