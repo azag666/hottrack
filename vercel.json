@@ -11,5 +11,12 @@
       "src": "/api/(.*)",
       "dest": "server.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/process-timeouts",
+      "schedule": "* * * * *" 
+      /* Chama o endpoint a cada minuto. O Vercel usa o CRON_SECRET automaticamente. */
+    }
   ]
 }
