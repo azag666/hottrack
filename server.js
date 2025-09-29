@@ -290,7 +290,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     if (startNode) {
                         const nextNodeInTargetFlow = findNextNode(startNode.id, null, targetFlowData.edges || []);
-                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, variables);
+                        processFlow(chatId, botId, bot.bot_token, sellerId, nextNodeInTargetFlow, variables);
                     }
                 }
                 currentNodeId = null; // Para o fluxo atual
@@ -355,7 +355,7 @@ app.get('/api/health', async (req, res) => {
         if (result[0]?.status === 1) {
             res.status(200).json({ status: 'ok', message: 'API está rodando e a conexão com o banco de dados foi bem-sucedida.' });
         } else {
-            throw new Error('O banco de dados não retornou o resultado esperado.');
+            throw new Error('O banco de dados não retornou o resultado esperado.' );
         }
     } catch (error) {
         console.error('[HEALTH CHECK ERROR]', error);
@@ -598,7 +598,16 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         
         let initialVars = {};
         if (message.text.startsWith('/start ')) {
-            initialVars.click_id = message.text;
+            // CORREÇÃO: Extrai o parâmetro e adiciona à variável inicial
+            const clickIdParam = message.text.substring(7).trim(); 
+            initialVars.click_id = clickIdParam;
+            
+            // ATUALIZA A TABELA telegram_chats com o click_id para ser exibido no painel
+            await sql`
+                UPDATE telegram_chats 
+                SET click_id = ${clickIdParam} 
+                WHERE chat_id = ${chatId} AND message_id = ${message.message_id};
+            `;
         }
         
         await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars);
