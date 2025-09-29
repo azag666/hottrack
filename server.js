@@ -348,6 +348,25 @@ app.post('/api/cron/process-timeouts', async (req, res) => {
 //          ENDPOINTS DA API DO HOTBOT
 // ==========================================================
 
+// --- ROTA DE DIAGNÓSTICO / HEALTH CHECK ---
+app.get('/api/health', async (req, res) => {
+    try {
+        const result = await sql`SELECT 1 as status;`;
+        if (result[0]?.status === 1) {
+            res.status(200).json({ status: 'ok', message: 'API está rodando e a conexão com o banco de dados foi bem-sucedida.' });
+        } else {
+            throw new Error('O banco de dados não retornou o resultado esperado.');
+        }
+    } catch (error) {
+        console.error('[HEALTH CHECK ERROR]', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'A API está rodando, mas não conseguiu se conectar ao banco de dados.',
+            error: error.message 
+        });
+    }
+});
+
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
