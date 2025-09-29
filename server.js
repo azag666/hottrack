@@ -105,26 +105,31 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
     let flowData;
     let variables = { ...initialVariables };
 
-    // CORREÇÃO FINAL: Lógica unificada e segura para carregar dados do fluxo
     try {
         if (variables.flow_data) {
-            flowData = typeof variables.flow_data === 'string' 
-                ? JSON.parse(variables.flow_data) 
-                : variables.flow_data;
+            // Cenário 1: Veio de um timeout. 'flow_data' já é o objeto que precisamos.
+            flowData = variables.flow_data;
             delete variables.flow_data;
         } else {
+            // Cenário 2: Novo fluxo. Busca a versão mais recente no banco.
             const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
-            const flowNodes = flowResult[0]?.nodes;
-            if (!flowNodes) {
+            const dbNodes = flowResult[0]?.nodes;
+            if (!dbNodes) {
                 console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
                 return;
             }
-            // Verifica se 'nodes' já é um objeto ou se precisa ser parseado
-            flowData = typeof flowNodes === 'string' ? JSON.parse(flowNodes) : flowNodes;
+            // O driver do Neon já converte a coluna JSON em um objeto JS automaticamente.
+            flowData = dbNodes;
+        }
+
+        // Validação final para garantir que temos dados de fluxo válidos
+        if (typeof flowData !== 'object' || !Array.isArray(flowData.nodes)) {
+            console.error("[Flow Engine] Erro fatal: Os dados do fluxo estão em um formato inválido.", flowData);
+            return;
         }
     } catch (e) {
-        console.error("[Flow Engine] Erro fatal ao carregar ou parsear dados do fluxo:", e);
-        return; // Interrompe a execução se os dados do fluxo estiverem corrompidos
+        console.error("[Flow Engine] Erro fatal ao carregar os dados do fluxo:", e);
+        return;
     }
 
     const { nodes = [], edges = [] } = flowData;
