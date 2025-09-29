@@ -48,8 +48,14 @@ async function sendTelegramRequest(botToken, method, data) {
     }
 }
 
+// CORREÇÃO: Função sendTypingAction para ser robusta contra erros de rede (ECONNRESET)
 async function sendTypingAction(chatId, botToken) {
-    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+    try {
+        await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+    } catch (error) {
+        // Silencia o erro para que a ação secundária não pare o fluxo principal
+        console.warn(`[TELEGRAM API WARN] Falha ao enviar ação 'typing' para ${chatId}. Continuando o fluxo.`);
+    }
 }
 
 async function saveMessageToDb(sellerId, botId, message, senderType) {
@@ -134,7 +140,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'message': {
                 const textToSend = await replaceVariables(nodeData.text, variables);
                 if (nodeData.showTyping) {
-                    await sendTypingAction(chatId, botToken);
+                    await sendTypingAction(chatId, botToken); // Ação robusta agora
                     let typingDuration = textToSend.length * 50;
                     typingDuration = Math.max(500, Math.min(2000, typingDuration));
                     await new Promise(resolve => setTimeout(resolve, typingDuration));
@@ -598,7 +604,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         
         let initialVars = {};
         if (message.text.startsWith('/start ')) {
-            // CORREÇÃO: Armazena a string COMPLETA para o banco de dados.
+            // CORREÇÃO: Armazena a string COMPLETA no banco de dados.
             const fullClickId = message.text; 
             
             // Para o processamento de fluxo, usamos apenas o parâmetro (sem "/start ")
