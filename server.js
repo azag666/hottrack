@@ -330,7 +330,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 }
 
 // --- ROTA DO CRON JOB ---
-app.post('/api/cron/process-timeouts', async (req, res) => {
+app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) {
         return res.status(401).send('Unauthorized');
