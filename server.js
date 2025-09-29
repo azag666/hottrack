@@ -113,16 +113,15 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         } else {
             // Cenário 2: Novo fluxo. Busca a versão mais recente no banco.
             const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
-            const dbNodes = flowResult[0]?.nodes;
-            if (!dbNodes) {
+            const dbFlowData = flowResult[0]?.nodes;
+            if (!dbFlowData) {
                 console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
                 return;
             }
-            // O driver do Neon já converte a coluna JSON em um objeto JS automaticamente.
-            flowData = dbNodes;
+            // O driver do Neon já converte a coluna JSON em um objeto JS.
+            flowData = dbFlowData;
         }
 
-        // Validação final para garantir que temos dados de fluxo válidos
         if (typeof flowData !== 'object' || !Array.isArray(flowData.nodes)) {
             console.error("[Flow Engine] Erro fatal: Os dados do fluxo estão em um formato inválido.", flowData);
             return;
@@ -387,6 +386,8 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const bot = botResult[0];
                     if (bot) {
                         console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+                        // As variáveis do timeout já são um objeto JS, mas o flow_data dentro dele é uma string JSON
+                        const parsedVariables = { ...timeout.variables, flow_data: JSON.parse(timeout.variables.flow_data) };
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, timeout.variables);
                     }
                 }
