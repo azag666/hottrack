@@ -105,18 +105,26 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
     let flowData;
     let variables = { ...initialVariables };
 
-    if (variables.flow_data) {
-        flowData = typeof variables.flow_data === 'string' 
-            ? JSON.parse(variables.flow_data) 
-            : variables.flow_data;
-        delete variables.flow_data;
-    } else {
-        const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
-        if (!flowResult || flowResult.length === 0 || !flowResult[0].nodes) {
-            console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
-            return;
+    // CORREÇÃO FINAL: Lógica unificada e segura para carregar dados do fluxo
+    try {
+        if (variables.flow_data) {
+            flowData = typeof variables.flow_data === 'string' 
+                ? JSON.parse(variables.flow_data) 
+                : variables.flow_data;
+            delete variables.flow_data;
+        } else {
+            const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
+            const flowNodes = flowResult[0]?.nodes;
+            if (!flowNodes) {
+                console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
+                return;
+            }
+            // Verifica se 'nodes' já é um objeto ou se precisa ser parseado
+            flowData = typeof flowNodes === 'string' ? JSON.parse(flowNodes) : flowNodes;
         }
-        flowData = JSON.parse(flowResult[0].nodes);
+    } catch (e) {
+        console.error("[Flow Engine] Erro fatal ao carregar ou parsear dados do fluxo:", e);
+        return; // Interrompe a execução se os dados do fluxo estiverem corrompidos
     }
 
     const { nodes = [], edges = [] } = flowData;
