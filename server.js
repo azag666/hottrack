@@ -16,12 +16,11 @@ app.use(express.json());
 const sql = neon(process.env.DATABASE_URL);
 
 // ==========================================================
-//          LÓGICA DE RETRY PARA O BANCO DE DADOS (CORRIGIDA)
+//          LÓGICA DE RETRY PARA O BANCO DE DADOS
 // ==========================================================
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
-            // CORREÇÃO: Chamando a função sql com (query, [params])
             return await sql(query, params);
         } catch (error) {
             const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
@@ -102,7 +101,18 @@ async function replaceVariables(text, variables) {
 
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}) {
     console.log(`[Flow Engine] Iniciando processo para ${chatId}. Nó inicial: ${startNodeId || 'Padrão'}`);
-    const [flow] = await sqlWithRetry('SELECT * FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
+    
+    let flow;
+    let flowDataFromVars = initialVariables.flow_data;
+    
+    // CORREÇÃO: Usa o flow_data das variáveis se ele existir (vindo do Cron Job)
+    if (flowDataFromVars) {
+        flow = { nodes: flowDataFromVars }; // Simula o objeto flow
+    } else {
+        const flowResult = await sqlWithRetry('SELECT * FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
+        flow = flowResult[0];
+    }
+
     if (!flow || !flow.nodes) {
         console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
         return;
@@ -113,8 +123,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     let currentNodeId = startNodeId;
     let variables = { ...initialVariables };
-    let userState;
+    // Remove o flow_data das variáveis para não poluir o estado
+    if (variables.flow_data) delete variables.flow_data;
 
+    let userState;
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
     userState = userStateResult[0];
 
@@ -178,11 +190,15 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
                         console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
+                        
+                        // CORREÇÃO: Inclui o flow.nodes nas variáveis do timeout
+                        const variablesWithFlow = { ...variables, flow_data: flow.nodes };
+                        
                         const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
                             VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)
                         `;
-                        await sqlWithRetry(queryTimeout, [chatId, botId, noReplyNodeId, JSON.stringify(variables)]);
+                        await sqlWithRetry(queryTimeout, [chatId, botId, noReplyNodeId, JSON.stringify(variablesWithFlow)]);
                     }
                     currentNodeId = null;
                 } else {
@@ -191,6 +207,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
             
+            // ... (o restante dos cases do switch permanece o mesmo)
             case 'image':
             case 'video':
             case 'audio': {
@@ -363,6 +380,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
                     if (bot) {
                         console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+                        // Passa as variáveis do timeout (que contêm o flow_data) para o processFlow
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, timeout.variables);
                     }
                 }
@@ -379,7 +397,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
 // ==========================================================
 //          ENDPOINTS DA API DO HOTBOT
 // ==========================================================
-
+// ... (O restante do código de endpoints continua o mesmo)
 app.get('/api/health', async (req, res) => {
     try {
         const result = await sqlWithRetry('SELECT 1 as status;');
