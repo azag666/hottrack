@@ -1,7 +1,7 @@
 {
-  "name": "hottrack-saas-api",
-  "version": "2.0.0",
-  "description": "API SAAS para tracking de leads e conversões.",
+  "name": "hotbot-api",
+  "version": "1.0.0",
+  "description": "API dedicada para funcionalidades do Hotbot (Telegram, Fluxos, Chat).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
