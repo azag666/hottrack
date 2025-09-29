@@ -15,6 +15,7 @@
   "crons": [
     {
       "path": "/api/cron/process-timeouts",
+      "method": "POST",
       "schedule": "* * * * *" 
     }
   ]
