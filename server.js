@@ -290,7 +290,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     if (startNode) {
                         const nextNodeInTargetFlow = findNextNode(startNode.id, null, targetFlowData.edges || []);
-                        processFlow(chatId, botId, bot.bot_token, sellerId, nextNodeInTargetFlow, variables);
+                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, variables);
                     }
                 }
                 currentNodeId = null; // Para o fluxo atual
@@ -598,14 +598,16 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         
         let initialVars = {};
         if (message.text.startsWith('/start ')) {
-            // CORREÇÃO: Extrai o parâmetro e adiciona à variável inicial
-            const clickIdParam = message.text.substring(7).trim(); 
-            initialVars.click_id = clickIdParam;
+            // CORREÇÃO: Armazena a string COMPLETA para o banco de dados.
+            const fullClickId = message.text; 
             
-            // ATUALIZA A TABELA telegram_chats com o click_id para ser exibido no painel
+            // Para o processamento de fluxo, usamos apenas o parâmetro (sem "/start ")
+            initialVars.click_id = message.text.substring(7).trim();
+            
+            // ATUALIZA A TABELA telegram_chats com a string COMPLETA para exibição no painel
             await sql`
                 UPDATE telegram_chats 
-                SET click_id = ${clickIdParam} 
+                SET click_id = ${fullClickId} 
                 WHERE chat_id = ${chatId} AND message_id = ${message.message_id};
             `;
         }
