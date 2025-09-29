@@ -63,7 +63,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
 
     await sql`
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type)
-        VALUES (${sellerId}, ${botId}, ${chat.id}, ${message_id}, ${from.id}, ${from.first_name || botInfo.first_name}, ${from.last_name || botInfo.last_name}, ${from.username}, ${text}, ${senderType})
+        VALUES (${sellerId}, ${botId}, ${chat.id}, ${message_id}, ${from.id}, ${from.first_name || botInfo.first_name}, ${from.last_name || botInfo.last_name}, ${from.username || null}, ${text}, ${senderType})
         ON CONFLICT (chat_id, message_id) DO NOTHING;
     `;
 }
