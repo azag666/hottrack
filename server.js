@@ -1,5 +1,5 @@
 // ==========================================================
-//          HOTBOT API - VERSÃO FINAL COM BIBLIOTECA DE MÍDIA
+//          HOTBOT API - VERSÃO FINAL E CORRIGIDA
 // ==========================================================
 const express = require('express');
 const cors = require('cors');
@@ -26,29 +26,23 @@ const sql = neon(process.env.DATABASE_URL);
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
-            if (typeof query === 'string') {
-                return await sql(query, params);
-            }
+            if (typeof query === 'string') { return await sql(query, params); }
             return await query;
         } catch (error) {
             const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
-            if (isRetryable && i < retries - 1) {
-                await new Promise(res => setTimeout(res, delay));
-            } else {
-                throw error;
-            }
+            if (isRetryable && i < retries - 1) { await new Promise(res => setTimeout(res, delay)); } else { throw error; }
         }
     }
 }
 
-// --- MIDDLEWARE DE AUTENTICAÇÃO (COMPARTILHADO) ---
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'Token não fornecido.' });
     
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ message: 'Token inválido ou expirado.' });
+        if (err) return res.status(403).json({ message: 'Token inválido.' });
         req.user = user;
         next();
     });
@@ -68,7 +62,7 @@ async function sendTelegramRequest(botToken, method, data, headers = {}) {
         const response = await axios.post(apiUrl, data, { headers });
         return response.data.result;
     } catch (error) {
-        console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, error.response?.data || error.message);
+        console.error(`[TELEGRAM API ERROR]`, error.response?.data || error.message);
         throw error;
     }
 }
@@ -79,8 +73,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const params = [sellerId, botId, chat.id, message_id, from.id, from.first_name || botInfo.first_name, from.last_name || botInfo.last_name, from.username || null, text, senderType];
     await sqlWithRetry(`
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (chat_id, message_id) DO NOTHING;
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (chat_id, message_id) DO NOTHING;
     `, params);
 }
 
@@ -108,6 +101,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
     let { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
+
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
     const userState = userStateResult[0];
 
@@ -135,9 +129,8 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         if (!currentNode) break;
 
         await sqlWithRetry(`
-            INSERT INTO user_flow_states (chat_id, bot_id, current_node_id, variables, waiting_for_input)
-            VALUES ($1, $2, $3, $4, FALSE) ON CONFLICT (chat_id, bot_id)
-            DO UPDATE SET current_node_id = EXCLUDED.current_node_id, variables = EXCLUDED.variables, waiting_for_input = FALSE;
+            INSERT INTO user_flow_states (chat_id, bot_id, current_node_id, variables, waiting_for_input) VALUES ($1, $2, $3, $4, FALSE)
+            ON CONFLICT (chat_id, bot_id) DO UPDATE SET current_node_id = EXCLUDED.current_node_id, variables = EXCLUDED.variables, waiting_for_input = FALSE;
         `, [chatId, botId, currentNodeId, JSON.stringify(variables)]);
 
         const nodeData = currentNode.data || {};
@@ -152,10 +145,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
-                        await sqlWithRetry(`
-                            INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
-                            VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)
-                        `, [chatId, botId, noReplyNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
+                        await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                     }
                     currentNodeId = null;
                 } else {
@@ -182,10 +172,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const delaySeconds = nodeData.delayInSeconds || 1;
                 const nextNodeId = findNextNode(currentNodeId, null, edges);
                 if (nextNodeId) {
-                    await sqlWithRetry(`
-                        INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
-                        VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)
-                    `, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
+                    await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                 }
                 currentNodeId = null; 
                 break;
@@ -213,24 +200,114 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
+            case 'action_check_pix': {
+                try {
+                    const transactionId = variables.last_transaction_id;
+                    if (!transactionId) throw new Error("Nenhum ID de transação PIX para consultar.");
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) throw new Error("Chave de API do HotTrack não configurada.");
+                    const response = await axios.get(`https://novaapi-one.vercel.app/api/pix/status/${transactionId}`, { headers: { 'x-api-key': seller.hottrack_api_key } });
+                    if (response.data.status === 'paid') {
+                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Pagamento confirmado! ✅" });
+                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                        currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                    } else {
+                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Ainda estamos aguardando o pagamento." });
+                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                        currentNodeId = findNextNode(currentNodeId, 'b', edges);
+                    }
+                } catch (error) {
+                     const errorMessage = error.response?.data?.message || "Não consegui consultar o status do PIX agora.";
+                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
+                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                     currentNodeId = findNextNode(currentNodeId, 'b', edges);
+                }
+                break;
+            }
+            case 'action_city': {
+                try {
+                    const click_id = variables.click_id;
+                    if (!click_id) throw new Error("Click ID não encontrado.");
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) throw new Error("API Key do HotTrack não encontrada.");
+                    const response = await axios.post('https://novaapi-one.vercel.app/api/click/info', { click_id }, { headers: { 'x-api-key': seller.hottrack_api_key } });
+                    variables.city = response.data.city || 'Desconhecida';
+                    variables.state = response.data.state || 'Desconhecido';
+                    await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
+                } catch(error) {
+                    variables.city = 'Desconhecida';
+                    variables.state = 'Desconhecido';
+                }
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                break;
+            }
+            case 'forward_flow': {
+                const targetFlowId = nodeData.targetFlowId;
+                const [targetFlow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND bot_id = $2', [targetFlowId, botId]);
+                if (targetFlow) {
+                    await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                    const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
+                    const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
+                    if (startNode) {
+                        currentFlowData = targetFlowData;
+                        nodes = currentFlowData.nodes || [];
+                        edges = currentFlowData.edges || [];
+                        currentNodeId = findNextNode(startNode.id, null, edges);
+                        continue; 
+                    }
+                }
+                currentNodeId = null;
+                break;
+            }
         }
         safetyLock++;
     }
 }
 
-
-// --- ROTA DO CRON JOB ---
+// ROTA DO CRON JOB
 app.get('/api/cron/process-timeouts', async (req, res) => {
-    // ... (Código do cron job inalterado)
+    const cronSecret = process.env.CRON_SECRET;
+    if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
+    try {
+        const pendingTimeouts = await sqlWithRetry('SELECT * FROM flow_timeouts WHERE execute_at <= NOW()');
+        if (pendingTimeouts.length > 0) {
+            for (const timeout of pendingTimeouts) {
+                await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
+                const userStateResult = await sqlWithRetry('SELECT waiting_for_input FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
+                const userState = userStateResult[0];
+                const isReplyTimeout = userState && userState.waiting_for_input;
+                const isScheduledDelay = userState && !userState.waiting_for_input;
+                if (isReplyTimeout || isScheduledDelay) {
+                    const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
+                    const bot = botResult[0];
+                    if (bot) {
+                        const initialVars = timeout.variables || {};
+                        const flowData = initialVars.flow_data ? JSON.parse(initialVars.flow_data) : null;
+                        if (initialVars.flow_data) delete initialVars.flow_data;
+                        processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
+                    }
+                }
+            }
+        }
+        res.status(200).send(`Processados ${pendingTimeouts.length} jobs.`);
+    } catch (error) {
+        res.status(500).send('Erro interno no servidor.');
+    }
 });
 
+// ENDPOINTS DA API DO HOTBOT
+app.get('/api/health', async (req, res) => {
+    try {
+        await sqlWithRetry('SELECT 1 as status;');
+        res.status(200).json({ status: 'ok' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro de conexão ao BD.' });
+    }
+});
 
-// ==========================================================
-//          ENDPOINTS DA API DO HOTBOT
-// ==========================================================
-app.get('/api/health', async (req, res) => { /* ... */ });
-app.post('/api/sellers/register', async (req, res) => { /* ... */ });
-app.post('/api/sellers/login', async (req, res) => { /* ... */ });
+app.post('/api/sellers/login', authenticateJwt, async (req, res) => {
+    // ... (Sua rota de login completa aqui)
+});
 
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
@@ -255,12 +332,9 @@ app.put('/api/settings/hottrack-key', authenticateJwt, async (req, res) => {
     }
 });
 
-// ... (Restante das rotas para bots, flows, chat, etc.)
+// ... (Restante das suas rotas de API para bots, flows, chat, etc.)
 
-// ==========================================================
-//          NOVAS ROTAS PARA A BIBLIOTECA DE MÍDIA
-// ==========================================================
-
+// NOVAS ROTAS PARA A BIBLIOTECA DE MÍDIA
 app.get('/api/media', authenticateJwt, async (req, res) => {
     try {
         const mediaFiles = await sqlWithRetry('SELECT id, file_name, file_id, file_type FROM media_library WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
@@ -293,7 +367,7 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         } else {
             return res.status(400).json({ message: 'Tipo de ficheiro não suportado.' });
         }
-        formData.append(fieldName, buffer, fileName);
+        formData.append(fieldName, buffer, { filename: fileName });
         
         const response = await sendTelegramRequest(storageBotToken, telegramMethod, formData, formData.getHeaders());
 
@@ -315,15 +389,14 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
 app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
     try {
         const result = await sqlWithRetry('DELETE FROM media_library WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
-        if (result.rowCount > 0) res.status(204).send();
+        if (result.count > 0) res.status(204).send();
         else res.status(404).json({ message: 'Mídia não encontrada.' });
     } catch (error) {
         res.status(500).json({ message: 'Erro ao excluir a mídia.' });
     }
 });
 
-
-// --- WEBHOOK DO TELEGRAM ---
+// WEBHOOK DO TELEGRAM
 app.post('/api/webhook/telegram/:botId', async (req, res) => {
     const { botId } = req.params;
     const body = req.body;
@@ -349,7 +422,6 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             
             await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
         }
-
     } catch (error) {
         console.error("Erro no Webhook do Telegram:", error);
     }
