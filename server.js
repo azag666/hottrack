@@ -20,7 +20,9 @@ app.use(cors({
 
 const sql = neon(process.env.DATABASE_URL);
 
-// ... (Funções sqlWithRetry e authenticateJwt permanecem iguais)
+// ==========================================================
+//          LÓGICA DE RETRY PARA O BANCO DE DADOS
+// ==========================================================
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -32,6 +34,8 @@ async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
         }
     }
 }
+
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -44,6 +48,13 @@ async function authenticateJwt(req, res, next) {
     });
 }
 
+// ==========================================================
+//          MOTOR DE FLUXO E LÓGICAS DO TELEGRAM
+// ==========================================================
+function findNextNode(currentNodeId, handleId, edges) {
+    const edge = edges.find(edge => edge.source === currentNodeId && (edge.sourceHandle === handleId || !edge.sourceHandle || handleId === null));
+    return edge ? edge.target : null;
+}
 
 async function sendTelegramRequest(botToken, method, data, options = {}) {
     const { headers = {}, responseType = 'json' } = options;
@@ -62,7 +73,6 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
     }
 }
 
-// ATUALIZADO: para salvar mídias do chat
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video } = message;
     
@@ -72,7 +82,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
 
     if (photo) {
         mediaType = 'photo';
-        mediaFileId = photo[photo.length - 1].file_id; // Pega a maior resolução
+        mediaFileId = photo[photo.length - 1].file_id;
         messageText = message.caption || '[Foto]';
     } else if (video) {
         mediaType = 'video';
@@ -81,24 +91,12 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     }
 
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
-    const params = [sellerId, botId, chat.id, message_id, from.id, from.first_name || botInfo.first_name, from.last_name || botInfo.last_name, from.username || null, messageText, senderType, mediaType, mediaFileId];
+    const params = [sellerId, botId, chat.id, message_id, from?.id || chat.id, from?.first_name || botInfo.first_name, from?.last_name || botInfo.last_name, from?.username || null, messageText, senderType, mediaType, mediaFileId];
     
     await sqlWithRetry(`
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (chat_id, message_id) DO NOTHING;
     `, params);
-}
-
-// ... (Função processFlow e outras rotas permanecem iguais, com pequenas correções)
-// NOTE: O código completo das outras rotas foi omitido para brevidade, mas o que você tinha antes continua válido.
-// A alteração mais importante está na nova rota de preview e na lógica de upload/save. Abaixo está o código completo.
-
-// ==========================================================
-//          MOTOR DE FLUXO E LÓGICAS DO TELEGRAM
-// ==========================================================
-function findNextNode(currentNodeId, handleId, edges) {
-    const edge = edges.find(edge => edge.source === currentNodeId && (edge.sourceHandle === handleId || !edge.sourceHandle || handleId === null));
-    return edge ? edge.target : null;
 }
 
 async function replaceVariables(text, variables) {
@@ -162,7 +160,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'message': {
                 const textToSend = await replaceVariables(nodeData.text, variables);
                 const response = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
-                await saveMessageToDb(sellerId, botId, response.result, 'bot');
+                if (response.ok) {
+                    await saveMessageToDb(sellerId, botId, response.result, 'bot');
+                }
                 if (nodeData.waitForReply) {
                     await sqlWithRetry('UPDATE user_flow_states SET waiting_for_input = TRUE WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
                     const timeoutMinutes = nodeData.replyTimeout || 5;
@@ -183,10 +183,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const method = typeMap[currentNode.type];
                 let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
+                let response;
 
                 if (fileIdentifier) {
                     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC');
-
                     if (isLibraryFile) {
                         try {
                             const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
@@ -204,14 +204,19 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                             formData.append(fieldMap[currentNode.type], fileBuffer, { filename: 'mediafile' });
                             if (caption) formData.append('caption', caption);
                             
-                            await sendTelegramRequest(botToken, method, formData, { headers: formData.getHeaders() });
+                            response = await sendTelegramRequest(botToken, method, formData, { headers: formData.getHeaders() });
                         } catch (e) {
                             console.error("Erro ao processar arquivo da biblioteca:", e.message);
                         }
                     } else {
                         const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier };
                         if (caption) payload.caption = caption;
-                        await sendTelegramRequest(botToken, method, payload);
+                        response = await sendTelegramRequest(botToken, method, payload);
+                    }
+                    
+                    // CORREÇÃO: Salva a mensagem de mídia no histórico do chat
+                    if (response && response.ok) {
+                        await saveMessageToDb(sellerId, botId, response.result, 'bot');
                     }
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
@@ -240,11 +245,15 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
                     const textToSend = `${customText}\n\n<code>${response.data.qr_code_text}</code>`;
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
-                    await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
+                    if (sentMessage.ok) {
+                        await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
+                    }
                 } catch (error) {
                     const errorMessage = error.response?.data?.message || error.message || "Erro ao gerar PIX.";
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
-                    await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
+                    if (sentMessage.ok) {
+                        await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
+                    }
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
@@ -253,8 +262,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
-
-// ... (Restante do arquivo a partir da ROTA DO CRON JOB)
 
 // ROTA DO CRON JOB
 app.get('/api/cron/process-timeouts', async (req, res) => {
@@ -435,16 +442,6 @@ app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar o fluxo.' }); }
 });
 
-// ATUALIZADO: para retornar dados de mídia
-app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
-    try {
-        const messages = await sqlWithRetry(`
-            SELECT * FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3 ORDER BY created_at ASC;`, [req.params.botId, req.params.chatId, req.user.id]);
-        res.status(200).json(messages);
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar mensagens.' }); }
-});
-
-
 app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     try {
         const users = await sqlWithRetry(`
@@ -455,6 +452,14 @@ app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
 });
 
+app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        const messages = await sqlWithRetry(`
+            SELECT * FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3 ORDER BY created_at ASC;`, [req.params.botId, req.params.chatId, req.user.id]);
+        res.status(200).json(messages);
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar mensagens.' }); }
+});
+
 app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => {
     const { chatId, text } = req.body;
     if (!chatId || !text) return res.status(400).json({ message: 'Chat ID e texto são obrigatórios.' });
@@ -463,7 +468,9 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
         if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
         
         const response = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text });
-        await saveMessageToDb(req.user.id, req.params.botId, response.result, 'operator');
+        if (response.ok) {
+            await saveMessageToDb(req.user.id, req.params.botId, response.result, 'operator');
+        }
         res.status(200).json({ message: 'Mensagem enviada!' });
     } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
 });
@@ -479,8 +486,6 @@ app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
 // ==========================================================
 //          ROTAS PARA A BIBLIOTECA DE MÍDIA
 // ==========================================================
-
-// NOVO: Rota para servir prévias de mídia de forma segura
 app.get('/api/media/preview/:bot_id/:file_id', async (req, res) => {
     try {
         const { bot_id, file_id } = req.params;
@@ -503,14 +508,14 @@ app.get('/api/media/preview/:bot_id/:file_id', async (req, res) => {
         const fileUrl = `https://api.telegram.org/file/bot${token}/${fileInfoResponse.result.file_path}`;
         
         const response = await axios.get(fileUrl, { responseType: 'stream' });
+        res.setHeader('Content-Type', response.headers['content-type']);
         response.data.pipe(res);
     } catch (error) {
+        console.error("Erro no preview:", error.message);
         res.status(500).send('Erro ao buscar o arquivo.');
     }
 });
 
-
-// ATUALIZADO: para retornar thumbnail_file_id
 app.get('/api/media', authenticateJwt, async (req, res) => {
     try {
         const mediaFiles = await sqlWithRetry('SELECT id, file_name, file_id, file_type, thumbnail_file_id FROM media_library WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
@@ -520,7 +525,6 @@ app.get('/api/media', authenticateJwt, async (req, res) => {
     }
 });
 
-// ATUALIZADO: para salvar thumbnail_file_id
 app.post('/api/media/upload', authenticateJwt, async (req, res) => {
     const { fileName, fileData, fileType } = req.body;
     if (!fileName || !fileData || !fileType) return res.status(400).json({ message: 'Dados do ficheiro incompletos.' });
@@ -552,9 +556,9 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         let fileId, thumbnailFileId = null;
 
         if (fileType === 'image') {
-            fileId = result.photo[result.photo.length - 1].file_id; // Maior resolução
-            thumbnailFileId = result.photo[0].file_id; // Menor resolução para thumbnail
-        } else { // video
+            fileId = result.photo[result.photo.length - 1].file_id;
+            thumbnailFileId = result.photo[0].file_id;
+        } else {
             fileId = result.video.file_id;
             thumbnailFileId = result.video.thumbnail?.file_id || null;
         }
@@ -572,7 +576,6 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
     }
 });
 
-
 app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
     try {
         const result = await sqlWithRetry('DELETE FROM media_library WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
@@ -582,7 +585,6 @@ app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao excluir a mídia.' });
     }
 });
-
 
 // --- WEBHOOK DO TELEGRAM ---
 app.post('/api/webhook/telegram/:botId', async (req, res) => {
@@ -602,7 +604,6 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
             await saveMessageToDb(bot.seller_id, botId, message, 'user');
             
-            // Só processa o fluxo se for uma mensagem de texto (para não iniciar fluxo com envio de mídia)
             if (message.text) {
                 let initialVars = {};
                 if (message.text.startsWith('/start ')) {
