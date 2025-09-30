@@ -59,13 +59,25 @@ function findNextNode(currentNodeId, handleId, edges) {
 async function sendTelegramRequest(botToken, method, data, headers = {}) {
     try {
         const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
-        const response = await axios.post(apiUrl, data, { headers });
+        const response = await axios.post(apiUrl, data, { headers, responseType: data instanceof FormData ? 'json' : 'arraybuffer' });
+        // Se a resposta for um arraybuffer (download de arquivo), retorne-o diretamente
+        if (response.headers['content-type'] !== 'application/json') {
+            return response.data;
+        }
         return response.data.result;
     } catch (error) {
-        console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, error.response?.data || error.message);
+        // Para o Axios, o erro de resposta está em error.response.data
+        const errorData = error.response?.data;
+        // Se a resposta do erro for um ArrayBuffer, tente decodificá-lo para string
+        const errorMessage = (errorData instanceof ArrayBuffer) 
+            ? JSON.parse(Buffer.from(errorData).toString('utf8'))
+            : errorData;
+
+        console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, errorMessage || error.message);
         throw error;
     }
 }
+
 
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text } = message;
@@ -152,7 +164,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 }
                 break;
             }
-            case 'image': case 'video': case 'audio': {
+             case 'image': case 'video': case 'audio': {
                 const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio' };
                 const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
                 const fieldMap = { image: 'photo', video: 'video', audio: 'audio' };
@@ -161,37 +173,38 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const caption = await replaceVariables(nodeData.caption, variables);
 
                 if (fileIdentifier) {
-                    // VERIFICA SE O IDENTIFICADOR É UM FILE_ID DA BIBLIOTECA (NÃO UMA URL PÚBLICA)
                     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC');
 
                     if (isLibraryFile) {
                         try {
-                            // Se for da biblioteca, precisamos obter a URL do arquivo usando o bot de armazenamento
                             const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
                             if (!storageBotToken) throw new Error('Storage bot token não configurado.');
                             
-                            // 1. Obter o file_path do Telegram
                             const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
-                            if (!fileInfo || !fileInfo.file_path) throw new Error('Não foi possível obter informações do arquivo do Telegram.');
+                            if (!fileInfo || !fileInfo.file_path) throw new Error('Não foi possível obter informações do arquivo.');
 
-                            // 2. Montar a URL de download final
                             const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.file_path}`;
                             
-                            // 3. Atualizar o identificador para ser a URL
-                            fileIdentifier = fileUrl;
+                            // Baixar o arquivo para um buffer
+                            const fileBuffer = await axios.get(fileUrl, { responseType: 'arraybuffer' }).then(res => res.data);
+
+                            // Re-enviar o arquivo como multipart/form-data usando o bot do fluxo
+                            const formData = new FormData();
+                            formData.append('chat_id', chatId);
+                            formData.append(fieldMap[currentNode.type], fileBuffer, { filename: 'mediafile' });
+                            if (caption) formData.append('caption', caption);
+                            
+                            await sendTelegramRequest(botToken, method, formData, formData.getHeaders());
 
                         } catch (e) {
                             console.error("Erro ao processar arquivo da biblioteca:", e.message);
-                            // Se falhar, pula para o próximo nó para não travar o fluxo
-                            currentNodeId = findNextNode(currentNodeId, 'a', edges);
-                            break;
                         }
+                    } else {
+                        // Envio normal por URL ou file_id (se o file_id pertencer ao próprio bot)
+                        const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier };
+                        if (caption) payload.caption = caption;
+                        await sendTelegramRequest(botToken, method, payload);
                     }
-                    
-                    // Envia usando o botToken do fluxo, mas com a URL (se for da biblioteca) ou o file_id/URL original
-                    const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier };
-                    if (caption) payload.caption = caption;
-                    await sendTelegramRequest(botToken, method, payload);
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
@@ -529,13 +542,13 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         if (body.message) {
             const message = body.message;
             const chatId = message?.chat?.id;
-            if (!chatId || !message.text) return;
+            if (!chatId) return; // Permitir mensagens sem texto (ex: /start com click_id)
             
             await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
             await saveMessageToDb(bot.seller_id, botId, message, 'user');
             
             let initialVars = {};
-            if (message.text.startsWith('/start ')) {
+            if (message.text && message.text.startsWith('/start ')) {
                 await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
                 initialVars.click_id = message.text; 
             }
