@@ -78,7 +78,6 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         messageText = message.caption || '[Vídeo]';
     }
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
-    // Para mensagens do operador, 'from' não existe na resposta do Telegram, então usamos os dados do chat
     const fromUser = from || chat;
     const params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId];
     await sqlWithRetry(`
@@ -418,8 +417,6 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
         res.status(200).json({ message: 'Mensagem enviada!' });
     } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
 });
-
-// NOVA ROTA: Para enviar mídia do chat ao vivo
 app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
     const { chatId, fileData, fileType, fileName } = req.body;
     if (!chatId || !fileData || !fileType || !fileName) {
@@ -428,11 +425,9 @@ app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
     try {
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [req.params.botId, req.user.id]);
         if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
-
         const buffer = Buffer.from(fileData, 'base64');
         const formData = new FormData();
         formData.append('chat_id', chatId);
-
         let method, field;
         if (fileType.startsWith('image/')) {
             method = 'sendPhoto';
@@ -444,20 +439,15 @@ app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
             return res.status(400).json({ message: 'Tipo de arquivo não suportado.' });
         }
         formData.append(field, buffer, { filename: fileName });
-        
         const response = await sendTelegramRequest(bot.bot_token, method, formData, { headers: formData.getHeaders() });
-
         if (response.ok) {
             await saveMessageToDb(req.user.id, req.params.botId, response.result, 'operator');
         }
         res.status(200).json({ message: 'Mídia enviada!' });
-
     } catch (error) {
         res.status(500).json({ message: 'Não foi possível enviar a mídia.' });
     }
 });
-
-
 app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
     try {
         await sqlWithRetry('DELETE FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3', [req.params.botId, req.params.chatId, req.user.id]);
@@ -465,6 +455,80 @@ app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
         res.status(204).send();
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
 });
+
+// ==========================================================
+//          NOVAS ROTAS PARA AÇÕES DO CHAT AO VIVO
+// ==========================================================
+app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
+    const { botId, chatId, click_id, valueInCents } = req.body;
+    try {
+        if (!click_id) return res.status(400).json({ message: "Usuário não tem um Click ID para gerar PIX." });
+        
+        const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [req.user.id]);
+        if (!seller || !seller.hottrack_api_key) return res.status(400).json({ message: "Chave de API do HotTrack não configurada." });
+        
+        const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id, value_cents: valueInCents }, { headers: { 'x-api-key': seller.hottrack_api_key } });
+        const { transaction_id, qr_code_text } = pixResponse.data;
+
+        await sqlWithRetry(`UPDATE telegram_chats SET last_transaction_id = $1 WHERE chat_id = $2`, [transaction_id, chatId]);
+
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1', [botId]);
+        const textToSend = `✅ PIX Gerado! Copie o código abaixo para pagar:\n\n<code>${qr_code_text}</code>`;
+        const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+
+        if (sentMessage.ok) {
+            await saveMessageToDb(req.user.id, botId, sentMessage.result, 'operator');
+        }
+        res.status(200).json({ message: 'PIX enviado ao usuário.' });
+    } catch (error) {
+        res.status(500).json({ message: error.response?.data?.message || 'Erro ao gerar PIX.' });
+    }
+});
+
+app.get('/api/chats/check-pix/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        const [chat] = await sqlWithRetry('SELECT last_transaction_id FROM telegram_chats WHERE chat_id = $1 AND last_transaction_id IS NOT NULL ORDER BY created_at DESC LIMIT 1', [chatId]);
+        if (!chat || !chat.last_transaction_id) return res.status(404).json({ message: 'Nenhuma transação PIX recente encontrada para este usuário.' });
+        
+        const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [req.user.id]);
+        if (!seller || !seller.hottrack_api_key) return res.status(400).json({ message: "Chave de API do HotTrack não configurada." });
+
+        const checkResponse = await axios.get(`https://novaapi-one.vercel.app/api/pix/status/${chat.last_transaction_id}`, { headers: { 'x-api-key': seller.hottrack_api_key } });
+        res.status(200).json(checkResponse.data);
+    } catch (error) {
+        res.status(500).json({ message: error.response?.data?.message || 'Erro ao consultar PIX.' });
+    }
+});
+
+app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
+    const { botId, chatId, flowId } = req.body;
+    try {
+        const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
+        if (!bot) return res.status(404).json({ message: 'Bot não encontrado' });
+        
+        const [flow] = await sqlWithRetry('SELECT nodes FROM flows WHERE id = $1 AND bot_id = $2', [flowId, botId]);
+        if (!flow) return res.status(404).json({ message: 'Fluxo não encontrado' });
+        
+        await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+        
+        // Inicia o fluxo a partir do primeiro nó após o gatilho
+        const flowData = flow.nodes;
+        const startNode = flowData.nodes.find(node => node.type === 'trigger');
+        const firstNodeId = findNextNode(startNode.id, null, flowData.edges);
+        
+        processFlow(chatId, botId, bot.bot_token, bot.seller_id, firstNodeId, {}, flowData);
+
+        res.status(200).json({ message: 'Fluxo iniciado para o usuário.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao iniciar fluxo.' });
+    }
+});
+
+
+// ==========================================================
+//          ROTAS PARA A BIBLIOTECA DE MÍDIA
+// ==========================================================
 app.get('/api/media/preview/:bot_id/:file_id', async (req, res) => {
     try {
         const { bot_id, file_id } = req.params;
@@ -472,7 +536,6 @@ app.get('/api/media/preview/:bot_id/:file_id', async (req, res) => {
         if (bot_id === 'storage') {
             token = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
         } else {
-            // Não precisa de autenticação JWT aqui, pois a rota é chamada pelo src de uma imagem
             const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1', [bot_id]);
             token = bot?.bot_token;
         }
