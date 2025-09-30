@@ -20,7 +20,9 @@ app.use(cors({
 
 const sql = neon(process.env.DATABASE_URL);
 
-// ... (Funções de utilidade como sqlWithRetry, authenticateJwt, etc.)
+// ==========================================================
+//          LÓGICA DE RETRY PARA O BANCO DE DADOS
+// ==========================================================
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -32,6 +34,8 @@ async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
         }
     }
 }
+
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
 async function authenticateJwt(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -43,10 +47,15 @@ async function authenticateJwt(req, res, next) {
         next();
     });
 }
+
+// ==========================================================
+//          MOTOR DE FLUXO E LÓGICAS DO TELEGRAM
+// ==========================================================
 function findNextNode(currentNodeId, handleId, edges) {
     const edge = edges.find(edge => edge.source === currentNodeId && (edge.sourceHandle === handleId || !edge.sourceHandle || handleId === null));
     return edge ? edge.target : null;
 }
+
 async function sendTelegramRequest(botToken, method, data, options = {}) {
     const { headers = {}, responseType = 'json' } = options;
     try {
@@ -64,9 +73,8 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
     }
 }
 
-// CORRIGIDO: Lógica de salvamento refeita para inserir CADA mensagem
 async function saveMessageToDb(sellerId, botId, message, senderType) {
-    const { message_id, chat, from, text, photo, video } = message;
+    const { message_id, chat, from, text, photo, video, voice } = message;
     let mediaType = null;
     let mediaFileId = null;
     let messageText = text;
@@ -84,18 +92,20 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         mediaType = 'video';
         mediaFileId = video.file_id;
         messageText = message.caption || '[Vídeo]';
+    } else if (voice) {
+        mediaType = 'voice';
+        mediaFileId = voice.file_id;
+        messageText = '[Mensagem de Voz]';
     }
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
 
-    // 1. Insere a nova mensagem, ignorando se ela já existir
     await sqlWithRetry(`
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (chat_id, message_id) DO NOTHING;
     `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId]);
 
-    // 2. Se um click_id foi recebido, atualiza o click_id para o chat
     if (clickId) {
         await sqlWithRetry(
             'UPDATE telegram_chats SET click_id = $1 WHERE chat_id = $2 AND bot_id = $3',
@@ -114,6 +124,7 @@ async function replaceVariables(text, variables) {
     }
     return processedText;
 }
+
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}, flowData = null) {
     let currentFlowData = flowData;
     let variables = { ...initialVariables };
@@ -178,9 +189,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
             case 'image': case 'video': case 'audio': {
-                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio' };
+                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
                 const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
-                const fieldMap = { image: 'photo', video: 'video', audio: 'audio' };
+                const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
                 const method = typeMap[currentNode.type];
                 let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
@@ -460,8 +471,11 @@ app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
         } else if (fileType.startsWith('video/')) {
             method = 'sendVideo';
             field = 'video';
+        } else if (fileType === 'audio/ogg') {
+            method = 'sendVoice';
+            field = 'voice';
         } else {
-            return res.status(400).json({ message: 'Tipo de arquivo não suportado.' });
+            return res.status(400).json({ message: 'Tipo de arquivo não suportado. Para voz, use OGG/Opus.' });
         }
         formData.append(field, buffer, { filename: fileName });
         const response = await sendTelegramRequest(bot.bot_token, method, formData, { headers: formData.getHeaders() });
@@ -591,6 +605,9 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         } else if (fileType === 'video') {
             telegramMethod = 'sendVideo';
             fieldName = 'video';
+        } else if (fileType === 'audio') { // Mapeia 'audio' para 'sendVoice'
+            telegramMethod = 'sendVoice';
+            fieldName = 'voice';
         } else {
             return res.status(400).json({ message: 'Tipo de ficheiro não suportado.' });
         }
@@ -601,9 +618,11 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         if (fileType === 'image') {
             fileId = result.photo[result.photo.length - 1].file_id;
             thumbnailFileId = result.photo[0].file_id;
-        } else {
+        } else if (fileType === 'video') {
             fileId = result.video.file_id;
             thumbnailFileId = result.video.thumbnail?.file_id || null;
+        } else { // audio/voice
+            fileId = result.voice.file_id;
         }
         if (!fileId) throw new Error('Não foi possível obter o file_id do Telegram.');
         const [newMedia] = await sqlWithRetry(`
