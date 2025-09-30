@@ -144,7 +144,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
         } else if (userState && !userState.waiting_for_input) {
             console.log(`[Flow Engine] Mensagem ignorada, bot não estava à espera de resposta.`);
-            return; // << -- CORREÇÃO PRINCIPAL ESTÁ AQUI
+            return;
         } else {
             console.log(`[Flow Engine] Iniciando novo fluxo para ${chatId} a partir do gatilho.`);
             const startNode = nodes.find(node => node.type === 'trigger');
@@ -197,7 +197,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
-                        console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
                         const variablesForTimeout = { ...variables, flow_data: JSON.stringify(currentFlowData) };
                         const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
@@ -238,7 +237,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const nextNodeId = findNextNode(currentNodeId, null, edges);
 
                 if (nextNodeId) {
-                    console.log(`[Flow Engine] Agendando atraso de ${delaySeconds}s para o nó ${nextNodeId}`);
                     const variablesForDelay = { ...variables, flow_data: JSON.stringify(currentFlowData) };
                     const queryDelay = `
                         INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
@@ -274,44 +272,15 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
                     
-                    const customText = nodeData.pixMessageText || 'Seu código PIX está abaixo:';
-                    const buttonText = nodeData.pixButtonText || '📋 Copiar Código PIX';
+                    const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
+                    const textToSend = `${customText}\n\n<code>${pixResult.qr_code_text}</code>`;
                     
-                    const messagePayload = {
-                        chat_id: chatId,
-                        text: `<pre>${pixResult.qr_code_text}</pre>\n\n${customText}`,
-                        parse_mode: 'HTML',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    {
-                                        text: buttonText,
-                                        copy_text: { 
-                                            text: pixResult.qr_code_text
-                                        }
-                                    }
-                                ]
-                            ]
-                        }
-                    };
-                    
-                    console.log("[Flow Engine] Tentando enviar payload com 'copy_text' para a API do Telegram.");
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', messagePayload);
-
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 } catch (error) {
                     console.error("[Flow Engine] Erro ao gerar PIX:", error.response?.data || error.message);
-                    
-                    let errorMessage = "Desculpe, não consegui gerar o PIX neste momento.";
-                    if (error.message.includes("A Chave de API do HotTrack não está configurada")) {
-                        errorMessage = error.message;
-                    } else if (error.response?.data?.message) {
-                        errorMessage = error.response.data.message;
-                    } else if (error.response?.data?.description?.includes("can't parse inline keyboard button")) {
-                         errorMessage = "[ERRO DE TESTE] O Telegram não reconheceu o botão 'copy_text'. Use a formatação <code>, como recomendado.";
-                    }
-                    
+                    const errorMessage = error.response?.data?.message || "Desculpe, não consegui gerar o PIX neste momento.";
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
                 }
@@ -454,10 +423,243 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
 // ==========================================================
 //          ENDPOINTS DA API DO HOTBOT
 // ==========================================================
-// ... (O resto das suas rotas de API, como /api/health, /api/sellers/register, etc., permanecem inalteradas)
-// ... Assegure-se de que o resto do seu ficheiro está aqui ...
+app.get('/api/health', async (req, res) => {
+    try {
+        await sqlWithRetry('SELECT 1 as status;');
+        res.status(200).json({ status: 'ok', message: 'API está a funcionar.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'API com erro de conexão ao BD.', error: error.message });
+    }
+});
 
-// --- WEBHOOK DO TELEGRAM (COM LÓGICA CORRIGIDA) ---
+app.post('/api/sellers/register', async (req, res) => {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
+    try {
+        const normalizedEmail = email.trim().toLowerCase();
+        const existingSeller = await sqlWithRetry('SELECT id FROM sellers WHERE LOWER(email) = $1', [normalizedEmail]);
+        if (existingSeller.length > 0) return res.status(409).json({ message: 'Este email já está em uso.' });
+        
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const apiKey = uuidv4();
+        await sqlWithRetry('INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES ($1, $2, $3, $4, TRUE)', [name, normalizedEmail, hashedPassword, apiKey]);
+        res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
+    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+});
+
+app.post('/api/sellers/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
+    try {
+        const normalizedEmail = email.trim().toLowerCase();
+        const [seller] = await sqlWithRetry('SELECT id, email, password_hash, is_active FROM sellers WHERE email = $1', [normalizedEmail]);
+        if (!seller) return res.status(404).json({ message: 'Usuário não encontrado.' });
+        
+        if (!seller.is_active) return res.status(403).json({ message: 'Este usuário está bloqueado.' });
+
+        const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
+        if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
+        
+        const token = jwt.sign({ id: seller.id, email: seller.email }, process.env.JWT_SECRET, { expiresIn: '1d' });
+        res.status(200).json({ token });
+    } catch (error) { 
+        res.status(500).json({ message: 'Erro interno do servidor.' }); 
+    }
+});
+
+app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
+    try {
+        const botsPromise = sqlWithRetry('SELECT * FROM telegram_bots WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
+        const settingsPromise = sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [req.user.id]);
+
+        const [bots, settingsResult] = await Promise.all([botsPromise, settingsPromise]);
+        
+        const settings = settingsResult[0] || {};
+
+        res.json({ bots, settings });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao buscar dados.' });
+    }
+});
+
+app.put('/api/settings/hottrack-key', authenticateJwt, async (req, res) => {
+    const { apiKey } = req.body;
+    if (typeof apiKey === 'undefined') {
+        return res.status(400).json({ message: 'O campo apiKey é obrigatório.' });
+    }
+    try {
+        await sqlWithRetry('UPDATE sellers SET hottrack_api_key = $1 WHERE id = $2', [apiKey, req.user.id]);
+        res.status(200).json({ message: 'Chave de API do HotTrack salva com sucesso!' });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao salvar a chave.' });
+    }
+});
+
+app.post('/api/bots', authenticateJwt, async (req, res) => {
+    const { bot_name } = req.body;
+    if (!bot_name) return res.status(400).json({ message: 'O nome do bot é obrigatório.' });
+    try {
+        const placeholderToken = `placeholder_${uuidv4()}`;
+        const [newBot] = await sqlWithRetry(`
+            INSERT INTO telegram_bots (seller_id, bot_name, bot_token) 
+            VALUES ($1, $2, $3) RETURNING *;`, [req.user.id, bot_name, placeholderToken]);
+        res.status(201).json(newBot);
+    } catch (error) {
+        if (error.code === '23505') return res.status(409).json({ message: 'Um bot com este nome de usuário já existe.' });
+        res.status(500).json({ message: 'Erro ao salvar o bot.' });
+    }
+});
+
+app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
+    try {
+        await sqlWithRetry('DELETE FROM telegram_bots WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
+});
+
+app.put('/api/bots/:id', authenticateJwt, async (req, res) => {
+    const { bot_token } = req.body;
+    if (!bot_token) return res.status(400).json({ message: 'O token do bot é obrigatório.' });
+    try {
+        await sqlWithRetry('UPDATE telegram_bots SET bot_token = $1 WHERE id = $2 AND seller_id = $3', [bot_token.trim(), req.params.id, req.user.id]);
+        res.status(200).json({ message: 'Token do bot atualizado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao atualizar o token.' }); }
+});
+
+app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [id, req.user.id]);
+        if (!bot || !bot.bot_token) return res.status(400).json({ message: 'Token do bot não configurado.' });
+        
+        const webhookUrl = `https://hottrack.vercel.app/api/webhook/telegram/${id}`;
+        await sendTelegramRequest(bot.bot_token, 'setWebhook', { url: webhookUrl });
+        res.status(200).json({ message: 'Webhook configurado com sucesso!' });
+    } catch (error) {
+        res.status(500).json({ message: `Erro ao configurar webhook: ${error.message}` });
+    }
+});
+
+app.get('/api/flows', authenticateJwt, async (req, res) => {
+    try {
+        const flows = await sqlWithRetry('SELECT * FROM flows WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
+        res.status(200).json(flows.map(f => ({ ...f, nodes: f.nodes || { nodes: [], edges: [] } })));
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar os fluxos.' }); }
+});
+
+app.post('/api/flows', authenticateJwt, async (req, res) => {
+    const { name, botId } = req.body;
+    if (!name || !botId) return res.status(400).json({ message: 'Nome e ID do bot são obrigatórios.' });
+    try {
+        const initialFlow = { nodes: [{ id: 'start', type: 'trigger', position: { x: 250, y: 50 }, data: {} }], edges: [] };
+        const [newFlow] = await sqlWithRetry(`
+            INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES ($1, $2, $3, $4) RETURNING *;`, [req.user.id, botId, name, JSON.stringify(initialFlow)]);
+        res.status(201).json(newFlow);
+    } catch (error) { res.status(500).json({ message: 'Erro ao criar o fluxo.' }); }
+});
+
+app.put('/api/flows/:id', authenticateJwt, async (req, res) => {
+    const { name, nodes } = req.body;
+    if (!name || !nodes) return res.status(400).json({ message: 'Nome e estrutura de nós são obrigatórios.' });
+    try {
+        const [updated] = await sqlWithRetry('UPDATE flows SET name = $1, nodes = $2, updated_at = NOW() WHERE id = $3 AND seller_id = $4 RETURNING *;', [name, nodes, req.params.id, req.user.id]);
+        if (updated) res.status(200).json(updated);
+        else res.status(404).json({ message: 'Fluxo não encontrado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao salvar o fluxo.' }); }
+});
+
+app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
+    try {
+        const result = await sqlWithRetry('DELETE FROM flows WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
+        if (result.count > 0) res.status(204).send();
+        else res.status(404).json({ message: 'Fluxo não encontrado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao deletar o fluxo.' }); }
+});
+
+app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
+    try {
+        const users = await sqlWithRetry(`
+            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
+            WHERE bot_id = $1 AND seller_id = $2
+            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
+        res.status(200).json(users);
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
+});
+
+app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        const messages = await sqlWithRetry(`
+            SELECT * FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3 ORDER BY created_at ASC;`, [req.params.botId, req.params.chatId, req.user.id]);
+        res.status(200).json(messages);
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar mensagens.' }); }
+});
+
+app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => {
+    const { chatId, text } = req.body;
+    if (!chatId || !text) return res.status(400).json({ message: 'Chat ID e texto são obrigatórios.' });
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [req.params.botId, req.user.id]);
+        if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
+        
+        const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text });
+        await saveMessageToDb(req.user.id, req.params.botId, sentMessage, 'operator');
+        res.status(200).json({ message: 'Mensagem enviada!' });
+    } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
+});
+
+app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        await sqlWithRetry('DELETE FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3', [req.params.botId, req.params.chatId, req.user.id]);
+        await sqlWithRetry('DELETE FROM user_flow_states WHERE bot_id = $1 AND chat_id = $2', [req.params.botId, req.params.chatId]);
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
+});
+
+app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
+    const { botIds, initialText, ctaButtonText, externalLink, imageUrl } = req.body;
+
+    if (!botIds || !initialText || !ctaButtonText) return res.status(400).json({ message: 'Campos obrigatórios faltando.' });
+    try {
+        const bots = await sqlWithRetry('SELECT id, bot_token FROM telegram_bots WHERE id = ANY($1) AND seller_id = $2', [botIds, req.user.id]);
+        if (bots.length === 0) return res.status(404).json({ message: 'Nenhum bot válido selecionado.' });
+        
+        const users = await sqlWithRetry('SELECT DISTINCT ON (chat_id) chat_id, bot_id FROM telegram_chats WHERE bot_id = ANY($1) AND seller_id = $2', [botIds, req.user.id]);
+        if (users.length === 0) return res.status(404).json({ message: 'Nenhum usuário encontrado.' });
+
+        res.status(202).json({ message: `Disparo agendado para ${users.length} usuários.` });
+        
+        (async () => {
+            const botTokenMap = new Map(bots.map(b => [b.id, b.bot_token]));
+            for (const user of users) {
+                const botToken = botTokenMap.get(user.bot_id);
+                if (!botToken) continue;
+
+                const method = imageUrl ? 'sendPhoto' : 'sendMessage';
+                const payload = { 
+                    chat_id: user.chat_id, 
+                    reply_markup: { inline_keyboard: [[{ text: ctaButtonText, url: externalLink }]] }
+                };
+                if(imageUrl) {
+                    payload.photo = imageUrl;
+                    payload.caption = initialText;
+                } else {
+                    payload.text = initialText;
+                }
+
+                try {
+                    await sendTelegramRequest(botToken, method, payload);
+                } catch (error) { console.error(`Falha ao enviar para ${user.chat_id}`); }
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            console.log(`Disparo concluído para ${users.length} usuários.`);
+        })();
+    } catch (error) {
+        if (!res.headersSent) res.status(500).json({ message: 'Erro ao iniciar o disparo.' });
+    }
+});
+
+
+// --- WEBHOOK DO TELEGRAM ---
 app.post('/api/webhook/telegram/:botId', async (req, res) => {
     const { botId } = req.params;
     const body = req.body;
@@ -507,5 +709,6 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         console.error("Erro no Webhook do Telegram:", error);
     }
 });
+
 
 module.exports = app;
