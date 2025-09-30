@@ -157,9 +157,38 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
                 const fieldMap = { image: 'photo', video: 'video', audio: 'audio' };
                 const method = typeMap[currentNode.type];
-                const fileIdentifier = nodeData[urlMap[currentNode.type]];
+                let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
+
                 if (fileIdentifier) {
+                    // VERIFICA SE O IDENTIFICADOR É UM FILE_ID DA BIBLIOTECA (NÃO UMA URL PÚBLICA)
+                    const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC');
+
+                    if (isLibraryFile) {
+                        try {
+                            // Se for da biblioteca, precisamos obter a URL do arquivo usando o bot de armazenamento
+                            const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
+                            if (!storageBotToken) throw new Error('Storage bot token não configurado.');
+                            
+                            // 1. Obter o file_path do Telegram
+                            const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
+                            if (!fileInfo || !fileInfo.file_path) throw new Error('Não foi possível obter informações do arquivo do Telegram.');
+
+                            // 2. Montar a URL de download final
+                            const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.file_path}`;
+                            
+                            // 3. Atualizar o identificador para ser a URL
+                            fileIdentifier = fileUrl;
+
+                        } catch (e) {
+                            console.error("Erro ao processar arquivo da biblioteca:", e.message);
+                            // Se falhar, pula para o próximo nó para não travar o fluxo
+                            currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                            break;
+                        }
+                    }
+                    
+                    // Envia usando o botToken do fluxo, mas com a URL (se for da biblioteca) ou o file_id/URL original
                     const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier };
                     if (caption) payload.caption = caption;
                     await sendTelegramRequest(botToken, method, payload);
