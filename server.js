@@ -193,7 +193,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
                         console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
-                        // Salva o flowData como string JSON para garantir consistência
                         const variablesForTimeout = { ...variables, flow_data: JSON.stringify(currentFlowData) };
                         const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
@@ -338,7 +337,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     if (startNode) {
                         const nextNodeInTargetFlow = findNextNode(startNode.id, null, targetFlowData.edges || []);
-                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, variables, targetFlowData);
+                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, {}, targetFlowData);
                     }
                 }
                 currentNodeId = null;
@@ -381,7 +380,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const bot = botResult[0];
                     if (bot) {
                         console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
-                        // As 'variables' do timeout já são um objeto JS, e o 'flow_data' dentro delas é uma string JSON
+                        
                         const initialVars = timeout.variables;
                         const flowData = JSON.parse(initialVars.flow_data);
                         delete initialVars.flow_data;
@@ -661,7 +660,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             `, [fullClickId, chatId, message.message_id]);
         }
         
-        await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars);
+        await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
 
     } catch (error) {
         console.error("Erro no Webhook do Telegram:", error);
