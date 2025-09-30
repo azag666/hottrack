@@ -384,26 +384,31 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
         const pendingTimeouts = await sqlWithRetry('SELECT * FROM flow_timeouts WHERE execute_at <= NOW()');
         if (pendingTimeouts.length > 0) {
             console.log(`[CRON] Encontrados ${pendingTimeouts.length} timeouts para processar.`);
-            for (const timeout of pendingTimeouts) {
-                await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
-                const userStateResult = await sqlWithRetry('SELECT waiting_for_input FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
-                const userState = userStateResult[0];
+           for (const timeout of pendingTimeouts) {
+    await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
+    
+    // A verificação 'waiting_for_input' foi removida para permitir que delays agendados também sejam processados.
+    // No entanto, ainda precisamos checar se o usuário não iniciou uma nova conversa enquanto o delay estava pendente.
+    // O webhook já deleta timeouts pendentes, mas uma checagem dupla aqui garante robustez.
+    // Se o estado do usuário foi deletado, significa que o fluxo foi interrompido e não devemos continuar.
+    const userStateResult = await sqlWithRetry('SELECT 1 FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
 
-                if (userState && userState.waiting_for_input) {
-                    const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
-                    const bot = botResult[0];
-                    if (bot) {
-                        console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
-                        
-                        const initialVars = timeout.variables;
-                        const flowData = JSON.parse(initialVars.flow_data);
-                        delete initialVars.flow_data;
+    if (userStateResult.length > 0) {
+        const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
+        const bot = botResult[0];
+        if (bot) {
+            console.log(`[CRON] Processando job agendado para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+            
+            const initialVars = timeout.variables;
+            const flowData = JSON.parse(initialVars.flow_data);
+            delete initialVars.flow_data;
 
-                        processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
-                    }
-                }
-            }
+            processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
         }
+    } else {
+        console.log(`[CRON] Job para ${timeout.chat_id} ignorado pois o estado do usuário não existe mais (fluxo interrompido).`);
+    }
+}
         res.status(200).send(`Processados ${pendingTimeouts.length} timeouts.`);
     } catch (error) {
         console.error('[CRON] Erro ao processar timeouts:', error);
