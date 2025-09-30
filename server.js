@@ -228,12 +228,26 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
 
-            case 'delay': {
-                const delaySeconds = nodeData.delayInSeconds || 1;
-                await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
-                currentNodeId = findNextNode(currentNodeId, null, edges);
-                break;
-            }
+            // CÓDIGO NOVO (CORRIGIDO)
+          case 'delay': {
+          const delaySeconds = nodeData.delayInSeconds || 1;
+          const nextNodeId = findNextNode(currentNodeId, null, edges);
+
+          if (nextNodeId) {
+           console.log(`[Flow Engine] Agendando atraso de ${delaySeconds}s para o nó ${nextNodeId}`);
+          // Reutilizamos a lógica do timeout para agendar a continuação
+          const variablesForDelay = { ...variables, flow_data: JSON.stringify(currentFlowData) };
+          const queryDelay = `
+            INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
+            VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)
+        `;
+        await sqlWithRetry(queryDelay, [chatId, botId, nextNodeId, JSON.stringify(variablesForDelay)]);
+    }
+
+    // Paramos a execução do fluxo atual, pois ele será retomado pelo cron job
+    currentNodeId = null; 
+    break;
+}
             
             case 'action_pix': {
                 try {
