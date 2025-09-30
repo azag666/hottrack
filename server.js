@@ -125,7 +125,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         return;
     }
 
-    const { nodes = [], edges = [] } = currentFlowData;
+    let { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
 
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
@@ -228,26 +228,22 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
 
-            // CÓDIGO NOVO (CORRIGIDO)
-          case 'delay': {
-          const delaySeconds = nodeData.delayInSeconds || 1;
-          const nextNodeId = findNextNode(currentNodeId, null, edges);
+            case 'delay': {
+                const delaySeconds = nodeData.delayInSeconds || 1;
+                const nextNodeId = findNextNode(currentNodeId, null, edges);
 
-          if (nextNodeId) {
-           console.log(`[Flow Engine] Agendando atraso de ${delaySeconds}s para o nó ${nextNodeId}`);
-          // Reutilizamos a lógica do timeout para agendar a continuação
-          const variablesForDelay = { ...variables, flow_data: JSON.stringify(currentFlowData) };
-          const queryDelay = `
-            INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
-            VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)
-        `;
-        await sqlWithRetry(queryDelay, [chatId, botId, nextNodeId, JSON.stringify(variablesForDelay)]);
-    }
-
-    // Paramos a execução do fluxo atual, pois ele será retomado pelo cron job
-    currentNodeId = null; 
-    break;
-}
+                if (nextNodeId) {
+                    console.log(`[Flow Engine] Agendando atraso de ${delaySeconds}s para o nó ${nextNodeId}`);
+                    const variablesForDelay = { ...variables, flow_data: JSON.stringify(currentFlowData) };
+                    const queryDelay = `
+                        INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
+                        VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)
+                    `;
+                    await sqlWithRetry(queryDelay, [chatId, botId, nextNodeId, JSON.stringify(variablesForDelay)]);
+                }
+                currentNodeId = null; 
+                break;
+            }
             
             case 'action_pix': {
                 try {
@@ -350,8 +346,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
                     
                     if (startNode) {
-                        const nextNodeInTargetFlow = findNextNode(startNode.id, null, targetFlowData.edges || []);
-                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, {}, targetFlowData);
+                        // Lógica iterativa para evitar recursão e estouro de pilha
+                        currentFlowData = targetFlowData;
+                        nodes = currentFlowData.nodes || [];
+                        edges = currentFlowData.edges || [];
+                        currentNodeId = findNextNode(startNode.id, null, edges);
+                        // Continua para a próxima iteração do loop 'while' com o novo fluxo
+                        continue; 
                     }
                 }
                 currentNodeId = null;
@@ -382,36 +383,45 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
     }
     try {
         const pendingTimeouts = await sqlWithRetry('SELECT * FROM flow_timeouts WHERE execute_at <= NOW()');
+        
         if (pendingTimeouts.length > 0) {
-            console.log(`[CRON] Encontrados ${pendingTimeouts.length} timeouts para processar.`);
-           for (const timeout of pendingTimeouts) {
-    await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
-    
-    // A verificação 'waiting_for_input' foi removida para permitir que delays agendados também sejam processados.
-    // No entanto, ainda precisamos checar se o usuário não iniciou uma nova conversa enquanto o delay estava pendente.
-    // O webhook já deleta timeouts pendentes, mas uma checagem dupla aqui garante robustez.
-    // Se o estado do usuário foi deletado, significa que o fluxo foi interrompido e não devemos continuar.
-    const userStateResult = await sqlWithRetry('SELECT 1 FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
-
-    if (userStateResult.length > 0) {
-        const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
-        const bot = botResult[0];
-        if (bot) {
-            console.log(`[CRON] Processando job agendado para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+            console.log(`[CRON] Encontrados ${pendingTimeouts.length} jobs agendados para processar.`);
             
-            const initialVars = timeout.variables;
-            const flowData = JSON.parse(initialVars.flow_data);
-            delete initialVars.flow_data;
+            for (const timeout of pendingTimeouts) {
+                // Deleta o job antes de processar para evitar re-execução em caso de falha
+                await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
+                
+                // Verifica se o usuário ainda está em um fluxo ativo. 
+                // Se o usuário interagiu, o estado pode ter sido limpo, e não devemos prosseguir.
+                const userStateResult = await sqlWithRetry('SELECT waiting_for_input FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
+                const userState = userStateResult[0];
 
-            processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
+                // A condição agora é: o estado do usuário AINDA EXISTE?
+                // E, se for um timeout de resposta, o usuário ainda está esperando?
+                // Para um delay, userState.waiting_for_input será false, então a segunda parte da condição é ignorada.
+                const isReplyTimeout = userState && userState.waiting_for_input;
+                const isScheduledDelay = userState && !userState.waiting_for_input;
+
+                if (isReplyTimeout || isScheduledDelay) {
+                    const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
+                    const bot = botResult[0];
+                    if (bot) {
+                        console.log(`[CRON] Processando job agendado para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
+                        
+                        const initialVars = timeout.variables || {};
+                        const flowData = initialVars.flow_data ? JSON.parse(initialVars.flow_data) : null;
+                        if (initialVars.flow_data) delete initialVars.flow_data;
+
+                        processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
+                    }
+                } else {
+                     console.log(`[CRON] Job para ${timeout.chat_id} ignorado pois o estado do usuário mudou ou não existe mais.`);
+                }
+            }
         }
-    } else {
-        console.log(`[CRON] Job para ${timeout.chat_id} ignorado pois o estado do usuário não existe mais (fluxo interrompido).`);
-    }
-}
-        res.status(200).send(`Processados ${pendingTimeouts.length} timeouts.`);
+        res.status(200).send(`Processados ${pendingTimeouts.length} jobs agendados.`);
     } catch (error) {
-        console.error('[CRON] Erro ao processar timeouts:', error);
+        console.error('[CRON] Erro ao processar jobs agendados:', error);
         res.status(500).send('Erro interno no servidor.');
     }
 });
@@ -660,6 +670,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         const chatId = message?.chat?.id;
         if (!chatId || !message.text) return;
         
+        // Limpa todos os timeouts/delays pendentes para este usuário, pois ele interagiu.
         await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
 
         const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
@@ -668,7 +679,11 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         await saveMessageToDb(bot.seller_id, botId, message, 'user');
         
         let initialVars = {};
+        // Se a mensagem é um /start, reseta o estado do fluxo para garantir um início limpo.
         if (message.text.startsWith('/start ')) {
+            console.log(`[Webhook] Comando /start recebido para ${chatId}. Resetando estado do fluxo.`);
+            await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+            
             const fullClickId = message.text; 
             initialVars.click_id = message.text.substring(7).trim();
             
