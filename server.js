@@ -20,7 +20,7 @@ app.use(cors({
 
 const sql = neon(process.env.DATABASE_URL);
 
-// ... (Funções de utilidade como sqlWithRetry, authenticateJwt, findNextNode, etc. permanecem as mesmas)
+// ... (Funções de utilidade como sqlWithRetry, authenticateJwt, etc. permanecem as mesmas)
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -63,11 +63,19 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
         throw error;
     }
 }
+
+// ATUALIZADO: para extrair e salvar o click_id
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video } = message;
     let mediaType = null;
     let mediaFileId = null;
     let messageText = text;
+    let clickId = null;
+
+    if (text && text.startsWith('/start ')) {
+        clickId = text.substring(7); // Extrai o valor do click_id
+    }
+
     if (photo) {
         mediaType = 'photo';
         mediaFileId = photo[photo.length - 1].file_id;
@@ -79,12 +87,37 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     }
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
-    const params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId];
-    await sqlWithRetry(`
-        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (chat_id, message_id) DO NOTHING;
-    `, params);
+
+    // Constrói a query dinamicamente para atualizar o click_id apenas se ele existir
+    let query;
+    let params;
+
+    const baseQuery = `
+        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id, click_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (chat_id) DO UPDATE SET
+            message_id = EXCLUDED.message_id,
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            username = EXCLUDED.username,
+            message_text = EXCLUDED.message_text,
+            sender_type = EXCLUDED.sender_type,
+            media_type = EXCLUDED.media_type,
+            media_file_id = EXCLUDED.media_file_id
+    `;
+    
+    // Atualiza o click_id apenas se um novo foi fornecido
+    if (clickId) {
+        query = baseQuery + ', click_id = EXCLUDED.click_id;';
+        params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, clickId];
+    } else {
+        query = baseQuery + ';';
+         params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, null];
+    }
+
+    await sqlWithRetry(query, params);
 }
+
 async function replaceVariables(text, variables) {
     if (!text) return '';
     let processedText = text;
@@ -94,9 +127,12 @@ async function replaceVariables(text, variables) {
     }
     return processedText;
 }
+
+// ATUALIZADO: para salvar o click_id no estado do fluxo
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}, flowData = null) {
     let currentFlowData = flowData;
     let variables = { ...initialVariables };
+
     try {
         if (!currentFlowData) {
             const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
@@ -104,11 +140,21 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         }
         if (!currentFlowData) return;
     } catch (e) { return; }
+
     let { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
     const userState = userStateResult[0];
-    if (userState) variables = { ...userState.variables, ...variables };
+    
+    if (userState) {
+        variables = { ...userState.variables, ...variables };
+    }
+    
+    // Garante que o click_id mais recente seja salvo no estado do fluxo
+    if (initialVariables.click_id) {
+        variables.click_id = initialVariables.click_id;
+    }
+
     if (!currentNodeId) {
         if (userState && userState.waiting_for_input) {
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
@@ -204,7 +250,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const valueInCents = nodeData.valueInCents;
                     if (!valueInCents) throw new Error("Valor do PIX não definido.");
                     const click_id = variables.click_id;
-                    if (!click_id) throw new Error("Click ID não encontrado.");
+                    if (!click_id) throw new Error("Click ID não encontrado para gerar PIX.");
                     const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
                     if (!seller || !seller.hottrack_api_key) throw new Error("Chave de API do HotTrack não configurada.");
                     const response = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id, value_cents: valueInCents }, { headers: { 'x-api-key': seller.hottrack_api_key } });
@@ -230,6 +276,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
+// ... (Restante do arquivo permanece o mesmo)
 app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
@@ -455,10 +502,6 @@ app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
         res.status(204).send();
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
 });
-
-// ==========================================================
-//          NOVAS ROTAS PARA AÇÕES DO CHAT AO VIVO
-// ==========================================================
 app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
     const { botId, chatId, click_id, valueInCents } = req.body;
     try {
@@ -484,7 +527,6 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: error.response?.data?.message || 'Erro ao gerar PIX.' });
     }
 });
-
 app.get('/api/chats/check-pix/:chatId', authenticateJwt, async (req, res) => {
     try {
         const { chatId } = req.params;
@@ -500,7 +542,6 @@ app.get('/api/chats/check-pix/:chatId', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: error.response?.data?.message || 'Erro ao consultar PIX.' });
     }
 });
-
 app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
     const { botId, chatId, flowId } = req.body;
     try {
@@ -512,7 +553,6 @@ app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
         
         await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
         
-        // Inicia o fluxo a partir do primeiro nó após o gatilho
         const flowData = flow.nodes;
         const startNode = flowData.nodes.find(node => node.type === 'trigger');
         const firstNodeId = findNextNode(startNode.id, null, flowData.edges);
@@ -524,11 +564,6 @@ app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao iniciar fluxo.' });
     }
 });
-
-
-// ==========================================================
-//          ROTAS PARA A BIBLIOTECA DE MÍDIA
-// ==========================================================
 app.get('/api/media/preview/:bot_id/:file_id', async (req, res) => {
     try {
         const { bot_id, file_id } = req.params;
@@ -627,8 +662,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             if (message.text) {
                 let initialVars = {};
                 if (message.text.startsWith('/start ')) {
-                    await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-                    initialVars.click_id = message.text; 
+                    initialVars.click_id = message.text.substring(7);
                 }
                 await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
             }
