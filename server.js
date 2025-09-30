@@ -56,28 +56,22 @@ function findNextNode(currentNodeId, handleId, edges) {
     return edge ? edge.target : null;
 }
 
-async function sendTelegramRequest(botToken, method, data, headers = {}) {
+async function sendTelegramRequest(botToken, method, data, options = {}) {
+    const { headers = {}, responseType = 'json' } = options;
     try {
         const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
-        const response = await axios.post(apiUrl, data, { headers, responseType: data instanceof FormData ? 'json' : 'arraybuffer' });
-        // Se a resposta for um arraybuffer (download de arquivo), retorne-o diretamente
-        if (response.headers['content-type'] !== 'application/json') {
-            return response.data;
-        }
-        return response.data.result;
+        const response = await axios.post(apiUrl, data, { headers, responseType });
+        return response.data;
     } catch (error) {
-        // Para o Axios, o erro de resposta está em error.response.data
         const errorData = error.response?.data;
-        // Se a resposta do erro for um ArrayBuffer, tente decodificá-lo para string
         const errorMessage = (errorData instanceof ArrayBuffer) 
             ? JSON.parse(Buffer.from(errorData).toString('utf8'))
             : errorData;
-
+        
         console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, errorMessage || error.message);
         throw error;
     }
 }
-
 
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text } = message;
@@ -149,8 +143,8 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         switch (currentNode.type) {
             case 'message': {
                 const textToSend = await replaceVariables(nodeData.text, variables);
-                const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
-                await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                const response = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+                await saveMessageToDb(sellerId, botId, response.result, 'bot');
                 if (nodeData.waitForReply) {
                     await sqlWithRetry('UPDATE user_flow_states SET waiting_for_input = TRUE WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
                     const timeoutMinutes = nodeData.replyTimeout || 5;
@@ -164,7 +158,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 }
                 break;
             }
-             case 'image': case 'video': case 'audio': {
+            case 'image': case 'video': case 'audio': {
                 const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio' };
                 const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
                 const fieldMap = { image: 'photo', video: 'video', audio: 'audio' };
@@ -180,27 +174,23 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                             const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
                             if (!storageBotToken) throw new Error('Storage bot token não configurado.');
                             
-                            const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
-                            if (!fileInfo || !fileInfo.file_path) throw new Error('Não foi possível obter informações do arquivo.');
-
-                            const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.file_path}`;
+                            const fileInfoResponse = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
+                            if (!fileInfoResponse.ok || !fileInfoResponse.result?.file_path) throw new Error('Não foi possível obter informações do arquivo.');
                             
-                            // Baixar o arquivo para um buffer
+                            const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfoResponse.result.file_path}`;
+                            
                             const fileBuffer = await axios.get(fileUrl, { responseType: 'arraybuffer' }).then(res => res.data);
 
-                            // Re-enviar o arquivo como multipart/form-data usando o bot do fluxo
                             const formData = new FormData();
                             formData.append('chat_id', chatId);
                             formData.append(fieldMap[currentNode.type], fileBuffer, { filename: 'mediafile' });
                             if (caption) formData.append('caption', caption);
                             
-                            await sendTelegramRequest(botToken, method, formData, formData.getHeaders());
-
+                            await sendTelegramRequest(botToken, method, formData, { headers: formData.getHeaders() });
                         } catch (e) {
                             console.error("Erro ao processar arquivo da biblioteca:", e.message);
                         }
                     } else {
-                        // Envio normal por URL ou file_id (se o file_id pertencer ao próprio bot)
                         const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier };
                         if (caption) payload.caption = caption;
                         await sendTelegramRequest(botToken, method, payload);
@@ -232,11 +222,11 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
                     const textToSend = `${customText}\n\n<code>${response.data.qr_code_text}</code>`;
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
-                    await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                    await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                 } catch (error) {
                     const errorMessage = error.response?.data?.message || error.message || "Erro ao gerar PIX.";
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
-                    await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                    await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
@@ -451,7 +441,7 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
         if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
         
         const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text });
-        await saveMessageToDb(req.user.id, req.params.botId, sentMessage, 'operator');
+        await saveMessageToDb(req.user.id, req.params.botId, sentMessage.result, 'operator');
         res.status(200).json({ message: 'Mensagem enviada!' });
     } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
 });
@@ -501,9 +491,8 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         }
         formData.append(fieldName, buffer, { filename: fileName });
         
-        const response = await sendTelegramRequest(storageBotToken, telegramMethod, formData, formData.getHeaders());
-
-        const result = response;
+        const response = await sendTelegramRequest(storageBotToken, telegramMethod, formData, { headers: formData.getHeaders() });
+        const result = response.result;
         const fileId = fileType === 'image' ? result.photo[result.photo.length - 1].file_id : result.video.file_id;
         if (!fileId) throw new Error('Não foi possível obter o file_id do Telegram.');
 
@@ -542,7 +531,7 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         if (body.message) {
             const message = body.message;
             const chatId = message?.chat?.id;
-            if (!chatId) return; // Permitir mensagens sem texto (ex: /start com click_id)
+            if (!chatId) return;
             
             await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
             await saveMessageToDb(bot.seller_id, botId, message, 'user');
