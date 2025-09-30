@@ -99,31 +99,25 @@ async function replaceVariables(text, variables) {
     return processedText;
 }
 
-async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}) {
+async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}, flowData = null) {
     console.log(`[Flow Engine] Iniciando processo para ${chatId}. Nó inicial: ${startNodeId || 'Padrão'}`);
     
-    let flowData;
+    let currentFlowData = flowData;
     let variables = { ...initialVariables };
 
     try {
-        if (variables.flow_data) {
-            // Cenário 1: Veio de um timeout. 'flow_data' já é o objeto que precisamos.
-            flowData = variables.flow_data;
-            delete variables.flow_data;
-        } else {
-            // Cenário 2: Novo fluxo. Busca a versão mais recente no banco.
+        if (!currentFlowData) {
             const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
             const dbFlowData = flowResult[0]?.nodes;
             if (!dbFlowData) {
                 console.log(`[Flow Engine] Nenhum fluxo ativo encontrado para o bot ID ${botId}.`);
                 return;
             }
-            // O driver do Neon já converte a coluna JSON em um objeto JS.
-            flowData = dbFlowData;
+            currentFlowData = dbFlowData;
         }
 
-        if (typeof flowData !== 'object' || !Array.isArray(flowData.nodes)) {
-            console.error("[Flow Engine] Erro fatal: Os dados do fluxo estão em um formato inválido.", flowData);
+        if (typeof currentFlowData !== 'object' || !Array.isArray(currentFlowData.nodes)) {
+            console.error("[Flow Engine] Erro fatal: Os dados do fluxo estão em um formato inválido.", currentFlowData);
             return;
         }
     } catch (e) {
@@ -131,7 +125,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         return;
     }
 
-    const { nodes = [], edges = [] } = flowData;
+    const { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
 
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
@@ -199,12 +193,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
                         console.log(`[Flow Engine] Agendando timeout de ${timeoutMinutes} min para o nó ${noReplyNodeId}`);
-                        const variablesWithFlow = { ...variables, flow_data: flowData };
+                        // Salva o flowData como string JSON para garantir consistência
+                        const variablesForTimeout = { ...variables, flow_data: JSON.stringify(currentFlowData) };
                         const queryTimeout = `
                             INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables)
                             VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)
                         `;
-                        await sqlWithRetry(queryTimeout, [chatId, botId, noReplyNodeId, JSON.stringify(variablesWithFlow)]);
+                        await sqlWithRetry(queryTimeout, [chatId, botId, noReplyNodeId, JSON.stringify(variablesForTimeout)]);
                     }
                     currentNodeId = null;
                 } else {
@@ -343,7 +338,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     if (startNode) {
                         const nextNodeInTargetFlow = findNextNode(startNode.id, null, targetFlowData.edges || []);
-                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, variables);
+                        processFlow(chatId, botId, botToken, sellerId, nextNodeInTargetFlow, variables, targetFlowData);
                     }
                 }
                 currentNodeId = null;
@@ -386,9 +381,12 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const bot = botResult[0];
                     if (bot) {
                         console.log(`[CRON] Processando timeout para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
-                        // As variáveis do timeout já são um objeto JS, mas o flow_data dentro dele é uma string JSON
-                        const parsedVariables = { ...timeout.variables, flow_data: JSON.parse(timeout.variables.flow_data) };
-                        processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, timeout.variables);
+                        // As 'variables' do timeout já são um objeto JS, e o 'flow_data' dentro delas é uma string JSON
+                        const initialVars = timeout.variables;
+                        const flowData = JSON.parse(initialVars.flow_data);
+                        delete initialVars.flow_data;
+
+                        processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
                     }
                 }
             }
