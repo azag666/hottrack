@@ -64,7 +64,7 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
     }
 }
 
-// ATUALIZADO: para extrair e salvar o click_id
+// CORRIGIDO: ON CONFLICT agora usa (bot_id, chat_id)
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video } = message;
     let mediaType = null;
@@ -73,7 +73,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     let clickId = null;
 
     if (text && text.startsWith('/start ')) {
-        clickId = text.substring(7); // Extrai o valor do click_id
+        clickId = text.substring(7);
     }
 
     if (photo) {
@@ -88,35 +88,30 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
 
-    // Constrói a query dinamicamente para atualizar o click_id apenas se ele existir
-    let query;
-    let params;
-
     const baseQuery = `
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id, click_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (chat_id) DO UPDATE SET
+        ON CONFLICT (bot_id, chat_id) DO UPDATE SET
             message_id = EXCLUDED.message_id,
             first_name = EXCLUDED.first_name,
             last_name = EXCLUDED.last_name,
             username = EXCLUDED.username,
             message_text = EXCLUDED.message_text,
-            sender_type = EXCLUDED.sender_type,
-            media_type = EXCLUDED.media_type,
-            media_file_id = EXCLUDED.media_file_id
+            created_at = NOW()
     `;
-    
-    // Atualiza o click_id apenas se um novo foi fornecido
+
+    let query;
+    let params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, clickId];
+
     if (clickId) {
         query = baseQuery + ', click_id = EXCLUDED.click_id;';
-        params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, clickId];
     } else {
         query = baseQuery + ';';
-         params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, null];
     }
-
+    
     await sqlWithRetry(query, params);
 }
+
 
 async function replaceVariables(text, variables) {
     if (!text) return '';
@@ -127,12 +122,9 @@ async function replaceVariables(text, variables) {
     }
     return processedText;
 }
-
-// ATUALIZADO: para salvar o click_id no estado do fluxo
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}, flowData = null) {
     let currentFlowData = flowData;
     let variables = { ...initialVariables };
-
     try {
         if (!currentFlowData) {
             const flowResult = await sqlWithRetry('SELECT nodes FROM flows WHERE bot_id = $1 ORDER BY updated_at DESC LIMIT 1', [botId]);
@@ -140,21 +132,16 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         }
         if (!currentFlowData) return;
     } catch (e) { return; }
-
     let { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
     const userState = userStateResult[0];
-    
     if (userState) {
         variables = { ...userState.variables, ...variables };
     }
-    
-    // Garante que o click_id mais recente seja salvo no estado do fluxo
     if (initialVariables.click_id) {
         variables.click_id = initialVariables.click_id;
     }
-
     if (!currentNodeId) {
         if (userState && userState.waiting_for_input) {
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
@@ -276,7 +263,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
-// ... (Restante do arquivo permanece o mesmo)
+// ... (O restante do arquivo, incluindo todas as outras rotas, permanece o mesmo)
 app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
@@ -438,9 +425,9 @@ app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
 app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     try {
         const users = await sqlWithRetry(`
-            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
+            SELECT DISTINCT ON (bot_id, chat_id) * FROM telegram_chats 
             WHERE bot_id = $1 AND seller_id = $2
-            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
+            ORDER BY bot_id, chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
         res.status(200).json(users);
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
 });
@@ -513,7 +500,7 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
         const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id, value_cents: valueInCents }, { headers: { 'x-api-key': seller.hottrack_api_key } });
         const { transaction_id, qr_code_text } = pixResponse.data;
 
-        await sqlWithRetry(`UPDATE telegram_chats SET last_transaction_id = $1 WHERE chat_id = $2`, [transaction_id, chatId]);
+        await sqlWithRetry(`UPDATE telegram_chats SET last_transaction_id = $1 WHERE bot_id = $2 AND chat_id = $3`, [transaction_id, botId, chatId]);
 
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1', [botId]);
         const textToSend = `✅ PIX Gerado! Copie o código abaixo para pagar:\n\n<code>${qr_code_text}</code>`;
@@ -527,10 +514,10 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: error.response?.data?.message || 'Erro ao gerar PIX.' });
     }
 });
-app.get('/api/chats/check-pix/:chatId', authenticateJwt, async (req, res) => {
+app.get('/api/chats/check-pix/:botId/:chatId', authenticateJwt, async (req, res) => {
     try {
-        const { chatId } = req.params;
-        const [chat] = await sqlWithRetry('SELECT last_transaction_id FROM telegram_chats WHERE chat_id = $1 AND last_transaction_id IS NOT NULL ORDER BY created_at DESC LIMIT 1', [chatId]);
+        const { botId, chatId } = req.params;
+        const [chat] = await sqlWithRetry('SELECT last_transaction_id FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND last_transaction_id IS NOT NULL ORDER BY created_at DESC LIMIT 1', [botId, chatId]);
         if (!chat || !chat.last_transaction_id) return res.status(404).json({ message: 'Nenhuma transação PIX recente encontrada para este usuário.' });
         
         const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [req.user.id]);
