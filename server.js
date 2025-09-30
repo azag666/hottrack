@@ -21,9 +21,11 @@ const sql = neon(process.env.DATABASE_URL);
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
+            // Se a query for uma string literal (template string), execute-a diretamente.
             if (typeof query === 'string') {
                 return await sql(query, params);
             }
+            // Se for um template literal taggeado, chame-o como uma função.
             return await query;
         } catch (error) {
             const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
@@ -253,7 +255,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const valueInCents = nodeData.valueInCents;
                     if (!valueInCents) throw new Error("Valor do PIX não definido no nó do fluxo.");
                     
-                    // CORREÇÃO DEFINITIVA: Usar o click_id completo, sem remover o prefixo.
                     const click_id = variables.click_id;
                     if (!click_id) throw new Error("Click ID não encontrado nas variáveis do fluxo para gerar PIX.");
 
@@ -274,8 +275,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
                     
-                    const textToSend = `Pix copia e cola gerado:\n\n\`${pixResult.qr_code_text}\``;
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'Markdown' });
+                    const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo e pague para continuar:';
+                    const textToSend = `${customText}\n\n<code>${pixResult.qr_code_text}</code>`;
+                    
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 } catch (error) {
@@ -323,7 +326,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
             case 'action_city': {
                 try {
-                    // CORREÇÃO DEFINITIVA: Usar o click_id completo, sem remover o prefixo.
                     const click_id = variables.click_id;
                     if (!click_id) throw new Error("Click ID não encontrado para consultar cidade.");
 
