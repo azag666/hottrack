@@ -20,7 +20,7 @@ app.use(cors({
 
 const sql = neon(process.env.DATABASE_URL);
 
-// ... (Funções de utilidade como sqlWithRetry, authenticateJwt, etc. permanecem as mesmas)
+// ... (Funções de utilidade como sqlWithRetry, authenticateJwt, etc.)
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -64,7 +64,7 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
     }
 }
 
-// CORRIGIDO: ON CONFLICT agora usa (bot_id, chat_id)
+// CORRIGIDO: Lógica de salvamento refeita para ser compatível com a chave primária
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video } = message;
     let mediaType = null;
@@ -88,30 +88,21 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
 
-    const baseQuery = `
-        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id, click_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (bot_id, chat_id) DO UPDATE SET
-            message_id = EXCLUDED.message_id,
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            username = EXCLUDED.username,
-            message_text = EXCLUDED.message_text,
-            created_at = NOW()
-    `;
+    // 1. Insere a nova mensagem, ignorando se ela já existir
+    await sqlWithRetry(`
+        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (chat_id, message_id) DO NOTHING;
+    `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId]);
 
-    let query;
-    let params = [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, clickId];
-
+    // 2. Se um click_id foi recebido, atualiza todas as entradas para esse chat
     if (clickId) {
-        query = baseQuery + ', click_id = EXCLUDED.click_id;';
-    } else {
-        query = baseQuery + ';';
+        await sqlWithRetry(
+            'UPDATE telegram_chats SET click_id = $1 WHERE chat_id = $2 AND bot_id = $3',
+            [clickId, chat.id, botId]
+        );
     }
-    
-    await sqlWithRetry(query, params);
 }
-
 
 async function replaceVariables(text, variables) {
     if (!text) return '';
@@ -263,7 +254,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
-// ... (O restante do arquivo, incluindo todas as outras rotas, permanece o mesmo)
 app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
