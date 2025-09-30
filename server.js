@@ -199,66 +199,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
-            case 'action_check_pix': {
-                 try {
-                    const transactionId = variables.last_transaction_id;
-                    if (!transactionId) throw new Error("Nenhum ID de transação PIX para consultar.");
-                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
-                    if (!seller || !seller.hottrack_api_key) throw new Error("A Chave de API do HotTrack não está configurada.");
-                    const hottrackApiUrl = `https://novaapi-one.vercel.app/api/pix/status/${transactionId}`;
-                    const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.hottrack_api_key } });
-                    if (response.data.status === 'paid') {
-                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Pagamento confirmado! ✅" });
-                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
-                        currentNodeId = findNextNode(currentNodeId, 'a', edges);
-                    } else {
-                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Ainda estamos aguardando o pagamento." });
-                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
-                        currentNodeId = findNextNode(currentNodeId, 'b', edges);
-                    }
-                } catch (error) {
-                     const errorMessage = error.response?.data?.message || "Não consegui consultar o status do PIX agora.";
-                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
-                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
-                     currentNodeId = findNextNode(currentNodeId, 'b', edges);
-                }
-                break;
-            }
-            case 'action_city': {
-                try {
-                    const click_id = variables.click_id;
-                    if (!click_id) throw new Error("Click ID não encontrado.");
-                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
-                    if (!seller || !seller.hottrack_api_key) throw new Error("API Key do HotTrack não encontrada.");
-                    const response = await axios.post('https://novaapi-one.vercel.app/api/click/info', { click_id }, { headers: { 'x-api-key': seller.hottrack_api_key } });
-                    variables.city = response.data.city || 'Desconhecida';
-                    variables.state = response.data.state || 'Desconhecido';
-                    await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
-                } catch(error) {
-                    variables.city = 'Desconhecida';
-                    variables.state = 'Desconhecido';
-                }
-                currentNodeId = findNextNode(currentNodeId, 'a', edges);
-                break;
-            }
-            case 'forward_flow': {
-                const targetFlowId = nodeData.targetFlowId;
-                const [targetFlow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND bot_id = $2', [targetFlowId, botId]);
-                if (targetFlow) {
-                    await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-                    const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
-                    const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
-                    if (startNode) {
-                        currentFlowData = targetFlowData;
-                        nodes = currentFlowData.nodes || [];
-                        edges = currentFlowData.edges || [];
-                        currentNodeId = findNextNode(startNode.id, null, edges);
-                        continue; 
-                    }
-                }
-                currentNodeId = null;
-                break;
-            }
         }
         safetyLock++;
     }
@@ -314,8 +254,7 @@ app.post('/api/sellers/register', async (req, res) => {
         if (existingSeller.length > 0) return res.status(409).json({ message: 'Este email já está em uso.' });
         
         const hashedPassword = await bcrypt.hash(password, 10);
-        const apiKey = uuidv4();
-        await sqlWithRetry('INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES ($1, $2, $3, $4, TRUE)', [name, normalizedEmail, hashedPassword, apiKey]);
+        await sqlWithRetry('INSERT INTO sellers (name, email, password_hash, is_active) VALUES ($1, $2, $3, TRUE)', [name, normalizedEmail, hashedPassword]);
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
     } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
 });
