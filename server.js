@@ -21,11 +21,9 @@ const sql = neon(process.env.DATABASE_URL);
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
-            // Se a query for uma string literal (template string), execute-a diretamente.
             if (typeof query === 'string') {
                 return await sql(query, params);
             }
-            // Se for um template literal taggeado, chame-o como uma função.
             return await query;
         } catch (error) {
             const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
@@ -260,11 +258,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
                     const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
                     if (!seller || !seller.hottrack_api_key) {
-                        throw new Error("A Chave de API do HotTrack não está configurada. Vá para a página de Integrações.");
+                        throw new Error("A Chave de API do HotTrack não está configurada.");
                     }
 
                     const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/pix/generate';
-                    console.log(`[Flow Engine] Chamando API HotTrack para gerar PIX para o click_id: ${click_id}`);
                     const response = await axios.post(hottrackApiUrl, 
                         { click_id, value_cents: valueInCents },
                         { headers: { 'x-api-key': seller.hottrack_api_key } }
@@ -275,15 +272,44 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     
                     await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
                     
-                    const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo e pague para continuar:';
-                    const textToSend = `${customText}\n\n<code>${pixResult.qr_code_text}</code>`;
+                    const customText = nodeData.pixMessageText || 'Seu código PIX está abaixo:';
+                    const buttonText = nodeData.pixButtonText || '📋 Copiar Código PIX';
                     
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+                    const messagePayload = {
+                        chat_id: chatId,
+                        text: `<pre>${pixResult.qr_code_text}</pre>\n\n${customText}`,
+                        parse_mode: 'HTML',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    {
+                                        text: buttonText,
+                                        copy_text: { 
+                                            text: pixResult.qr_code_text
+                                        }
+                                    }
+                                ]
+                            ]
+                        }
+                    };
+                    
+                    console.log("[Flow Engine] Tentando enviar payload com 'copy_text' para a API do Telegram.");
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', messagePayload);
+
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 } catch (error) {
-                    console.error("[Flow Engine] Erro ao gerar PIX via API HotTrack:", error.response?.data || error.message);
-                    const errorMessage = error.response?.data?.message || "Desculpe, não consegui gerar o PIX neste momento. Verifique suas configurações ou tente mais tarde.";
+                    console.error("[Flow Engine] Erro ao gerar PIX:", error.response?.data || error.message);
+                    
+                    let errorMessage = "Desculpe, não consegui gerar o PIX neste momento.";
+                    if (error.message.includes("A Chave de API do HotTrack não está configurada")) {
+                        errorMessage = error.message;
+                    } else if (error.response?.data?.message) {
+                        errorMessage = error.response.data.message;
+                    } else if (error.response?.data?.description?.includes("can't parse inline keyboard button")) {
+                         errorMessage = "[ERRO DE TESTE] O Telegram não reconheceu o botão 'copy_text'. Use a formatação <code>, como recomendado.";
+                    }
+                    
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
                 }
@@ -298,11 +324,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
                     const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
                     if (!seller || !seller.hottrack_api_key) {
-                        throw new Error("A Chave de API do HotTrack não está configurada. Vá para a página de Integrações.");
+                        throw new Error("A Chave de API do HotTrack não está configurada.");
                     }
                     
                     const hottrackApiUrl = `https://novaapi-one.vercel.app/api/pix/status/${transactionId}`;
-                    console.log(`[Flow Engine] Chamando API HotTrack para consultar status do PIX: ${transactionId}`);
                     const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.hottrack_api_key } });
                     
                     if (response.data.status === 'paid') {
@@ -315,7 +340,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                         currentNodeId = findNextNode(currentNodeId, 'b', edges);
                     }
                 } catch (error) {
-                     console.error("[Flow Engine] Erro ao consultar PIX via API HotTrack:", error.response?.data || error.message);
+                     console.error("[Flow Engine] Erro ao consultar PIX:", error.response?.data || error.message);
                      const errorMessage = error.response?.data?.message || "Não consegui consultar o status do PIX agora.";
                      const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                      await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
@@ -351,12 +376,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             
             case 'forward_flow': {
                 const targetFlowId = nodeData.targetFlowId;
-                console.log(`[Flow Engine] Encaminhando ${chatId} para o fluxo ID ${targetFlowId}`);
                 const [targetFlow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND bot_id = $2', [targetFlowId, botId]);
                 
                 if (targetFlow) {
                     await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-                    
                     const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
                     const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
                     
@@ -398,8 +421,6 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
         const pendingTimeouts = await sqlWithRetry('SELECT * FROM flow_timeouts WHERE execute_at <= NOW()');
         
         if (pendingTimeouts.length > 0) {
-            console.log(`[CRON] Encontrados ${pendingTimeouts.length} jobs agendados para processar.`);
-            
             for (const timeout of pendingTimeouts) {
                 await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
                 
@@ -413,16 +434,11 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
                     const bot = botResult[0];
                     if (bot) {
-                        console.log(`[CRON] Processando job agendado para ${timeout.chat_id} no nó ${timeout.target_node_id}`);
-                        
                         const initialVars = timeout.variables || {};
                         const flowData = initialVars.flow_data ? JSON.parse(initialVars.flow_data) : null;
                         if (initialVars.flow_data) delete initialVars.flow_data;
-
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
                     }
-                } else {
-                     console.log(`[CRON] Job para ${timeout.chat_id} ignorado pois o estado do usuário mudou ou não existe mais.`);
                 }
             }
         }
@@ -433,25 +449,16 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
     }
 });
 
-
 // ==========================================================
 //          ENDPOINTS DA API DO HOTBOT
 // ==========================================================
 app.get('/api/health', async (req, res) => {
     try {
         const result = await sqlWithRetry('SELECT 1 as status;');
-        if (result[0]?.status === 1) {
-            res.status(200).json({ status: 'ok', message: 'API está rodando e a conexão com o banco de dados foi bem-sucedida.' });
-        } else {
-            throw new Error('O banco de dados não retornou o resultado esperado.' );
-        }
+        res.status(200).json({ status: 'ok', message: 'API está rodando e a conexão com o banco de dados foi bem-sucedida.' });
     } catch (error) {
         console.error('[HEALTH CHECK ERROR]', error);
-        res.status(500).json({ 
-            status: 'error', 
-            message: 'A API está rodando, mas não conseguiu se conectar ao banco de dados.',
-            error: error.message 
-        });
+        res.status(500).json({ status: 'error', message: 'A API está rodando, mas não conseguiu se conectar ao banco de dados.', error: error.message });
     }
 });
 
@@ -478,9 +485,7 @@ app.post('/api/sellers/login', async (req, res) => {
         const [seller] = await sqlWithRetry('SELECT id, email, password_hash, is_active FROM sellers WHERE email = $1', [normalizedEmail]);
         if (!seller) return res.status(404).json({ message: 'Usuário não encontrado.' });
         
-        if (!seller.is_active) {
-            return res.status(403).json({ message: 'Este usuário está bloqueado.' });
-        }
+        if (!seller.is_active) return res.status(403).json({ message: 'Este usuário está bloqueado.' });
 
         const isPasswordCorrect = await bcrypt.compare(password, seller.password_hash);
         if (!isPasswordCorrect) return res.status(401).json({ message: 'Senha incorreta.' });
@@ -693,33 +698,49 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
     res.sendStatus(200);
 
     try {
-        const message = body.message;
-        const chatId = message?.chat?.id;
-        if (!chatId || !message.text) return;
-        
-        await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-
         const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
         if (!bot) return;
-        
-        await saveMessageToDb(bot.seller_id, botId, message, 'user');
-        
-        let initialVars = {};
-        if (message.text.startsWith('/start ')) {
-            console.log(`[Webhook] Comando /start recebido para ${chatId}. Resetando estado do fluxo.`);
-            await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-            
-            const fullClickId = message.text; 
-            initialVars.click_id = fullClickId;
-            
-            await sqlWithRetry(`
-                UPDATE telegram_chats 
-                SET click_id = $1 
-                WHERE chat_id = $2 AND message_id = $3;
-            `, [fullClickId, chatId, message.message_id]);
+
+        // Caso 1: O utilizador clicou num botão (callback_query)
+        if (body.callback_query) {
+            const { message, data } = body.callback_query;
+            const chatId = message.chat.id;
+
+            await sendTelegramRequest(bot.bot_token, 'answerCallbackQuery', { callback_query_id: body.callback_query.id });
+
+            const [action, value] = data.split('|');
+
+            if (action === 'continue_flow' && value) {
+                const userStateResult = await sqlWithRetry('SELECT variables FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                const variables = userStateResult[0]?.variables || {};
+                await processFlow(chatId, botId, bot.bot_token, bot.seller_id, value, variables);
+            }
+            return;
         }
-        
-        await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
+
+        // Caso 2: O utilizador enviou uma mensagem de texto
+        if (body.message) {
+            const message = body.message;
+            const chatId = message?.chat?.id;
+            if (!chatId || !message.text) return;
+            
+            await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+            await saveMessageToDb(bot.seller_id, botId, message, 'user');
+            
+            let initialVars = {};
+            if (message.text.startsWith('/start ')) {
+                await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                const fullClickId = message.text; 
+                initialVars.click_id = fullClickId;
+                await sqlWithRetry(`
+                    UPDATE telegram_chats 
+                    SET click_id = $1 
+                    WHERE chat_id = $2 AND message_id = $3;
+                `, [fullClickId, chatId, message.message_id]);
+            }
+            
+            await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
+        }
 
     } catch (error) {
         console.error("Erro no Webhook do Telegram:", error);
