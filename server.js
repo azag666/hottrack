@@ -197,7 +197,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const caption = await replaceVariables(nodeData.caption, variables);
                 let response;
                 if (fileIdentifier) {
-                    const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC');
+                    const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
                     if (isLibraryFile) {
                         try {
                             const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
