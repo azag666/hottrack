@@ -14,10 +14,6 @@
   ],
   "crons": [
     {
-      "path": "/api/cron/process-timeouts",
-      "schedule": "* * * * *" 
-    },
-    {
       "path": "/api/health",
       "schedule": "*/4 * * * *"
     }
