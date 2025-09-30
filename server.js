@@ -70,6 +70,7 @@ async function sendTelegramRequest(botToken, method, data, headers = {}) {
     }
 }
 
+
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text } = message;
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
@@ -242,8 +243,80 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
+            
+            case 'action_check_pix': {
+                 try {
+                    const transactionId = variables.last_transaction_id;
+                    if (!transactionId) throw new Error("Nenhum ID de transação PIX encontrado para consultar.");
 
-            // ... (restantes cases como action_check_pix, action_city, forward_flow)
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) throw new Error("A Chave de API do HotTrack não está configurada.");
+                    
+                    const hottrackApiUrl = `https://novaapi-one.vercel.app/api/pix/status/${transactionId}`;
+                    const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.hottrack_api_key } });
+                    
+                    if (response.data.status === 'paid') {
+                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Pagamento confirmado! ✅" });
+                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                        currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                    } else {
+                        const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Ainda estamos aguardando o pagamento." });
+                        await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                        currentNodeId = findNextNode(currentNodeId, 'b', edges);
+                    }
+                } catch (error) {
+                     const errorMessage = error.response?.data?.message || "Não consegui consultar o status do PIX agora.";
+                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
+                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
+                     currentNodeId = findNextNode(currentNodeId, 'b', edges);
+                }
+                break;
+            }
+
+            case 'action_city': {
+                try {
+                    const click_id = variables.click_id;
+                    if (!click_id) throw new Error("Click ID não encontrado para consultar cidade.");
+
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) throw new Error("API Key do HotTrack do vendedor não encontrada.");
+
+                    const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/click/info';
+                    const response = await axios.post(hottrackApiUrl, { click_id }, { headers: { 'x-api-key': seller.hottrack_api_key } });
+                    
+                    variables.city = response.data.city || 'Desconhecida';
+                    variables.state = response.data.state || 'Desconhecido';
+                    
+                    await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
+
+                } catch(error) {
+                    variables.city = 'Desconhecida';
+                    variables.state = 'Desconhecido';
+                }
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                break;
+            }
+
+            case 'forward_flow': {
+                const targetFlowId = nodeData.targetFlowId;
+                const [targetFlow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND bot_id = $2', [targetFlowId, botId]);
+                
+                if (targetFlow) {
+                    await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                    const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
+                    const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
+                    
+                    if (startNode) {
+                        currentFlowData = targetFlowData;
+                        nodes = currentFlowData.nodes || [];
+                        edges = currentFlowData.edges || [];
+                        currentNodeId = findNextNode(startNode.id, null, edges);
+                        continue; 
+                    }
+                }
+                currentNodeId = null;
+                break;
+            }
         }
         safetyLock++;
     }
@@ -283,7 +356,6 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
         }
         res.status(200).send(`Processados ${pendingTimeouts.length} jobs agendados.`);
     } catch (error) {
-        console.error('[CRON] Erro ao processar jobs agendados:', error);
         res.status(500).send('Erro interno no servidor.');
     }
 });
@@ -364,7 +436,125 @@ app.put('/api/settings/hottrack-key', authenticateJwt, async (req, res) => {
     }
 });
 
-// ... (Restante das rotas de API para bots, flows, chat, etc. - inalteradas)
+app.post('/api/bots', authenticateJwt, async (req, res) => {
+    const { bot_name } = req.body;
+    if (!bot_name) return res.status(400).json({ message: 'O nome do bot é obrigatório.' });
+    try {
+        const placeholderToken = `placeholder_${uuidv4()}`;
+        const [newBot] = await sqlWithRetry(`
+            INSERT INTO telegram_bots (seller_id, bot_name, bot_token) 
+            VALUES ($1, $2, $3) RETURNING *;`, [req.user.id, bot_name, placeholderToken]);
+        res.status(201).json(newBot);
+    } catch (error) {
+        if (error.code === '23505') return res.status(409).json({ message: 'Um bot com este nome de usuário já existe.' });
+        res.status(500).json({ message: 'Erro ao salvar o bot.' });
+    }
+});
+
+app.delete('/api/bots/:id', authenticateJwt, async (req, res) => {
+    try {
+        await sqlWithRetry('DELETE FROM telegram_bots WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao excluir o bot.' }); }
+});
+
+app.put('/api/bots/:id', authenticateJwt, async (req, res) => {
+    const { bot_token } = req.body;
+    if (!bot_token) return res.status(400).json({ message: 'O token do bot é obrigatório.' });
+    try {
+        await sqlWithRetry('UPDATE telegram_bots SET bot_token = $1 WHERE id = $2 AND seller_id = $3', [bot_token.trim(), req.params.id, req.user.id]);
+        res.status(200).json({ message: 'Token do bot atualizado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao atualizar o token.' }); }
+});
+
+app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [id, req.user.id]);
+        if (!bot || !bot.bot_token) return res.status(400).json({ message: 'Token do bot não configurado.' });
+        
+        const webhookUrl = `https://hottrack.vercel.app/api/webhook/telegram/${id}`;
+        await sendTelegramRequest(bot.bot_token, 'setWebhook', { url: webhookUrl });
+        res.status(200).json({ message: 'Webhook configurado com sucesso!' });
+    } catch (error) {
+        res.status(500).json({ message: `Erro ao configurar webhook: ${error.message}` });
+    }
+});
+
+app.get('/api/flows', authenticateJwt, async (req, res) => {
+    try {
+        const flows = await sqlWithRetry('SELECT * FROM flows WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
+        res.status(200).json(flows.map(f => ({ ...f, nodes: f.nodes || { nodes: [], edges: [] } })));
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar os fluxos.' }); }
+});
+
+app.post('/api/flows', authenticateJwt, async (req, res) => {
+    const { name, botId } = req.body;
+    if (!name || !botId) return res.status(400).json({ message: 'Nome e ID do bot são obrigatórios.' });
+    try {
+        const initialFlow = { nodes: [{ id: 'start', type: 'trigger', position: { x: 250, y: 50 }, data: {} }], edges: [] };
+        const [newFlow] = await sqlWithRetry(`
+            INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES ($1, $2, $3, $4) RETURNING *;`, [req.user.id, botId, name, JSON.stringify(initialFlow)]);
+        res.status(201).json(newFlow);
+    } catch (error) { res.status(500).json({ message: 'Erro ao criar o fluxo.' }); }
+});
+
+app.put('/api/flows/:id', authenticateJwt, async (req, res) => {
+    const { name, nodes } = req.body;
+    if (!name || !nodes) return res.status(400).json({ message: 'Nome e estrutura de nós são obrigatórios.' });
+    try {
+        const [updated] = await sqlWithRetry('UPDATE flows SET name = $1, nodes = $2, updated_at = NOW() WHERE id = $3 AND seller_id = $4 RETURNING *;', [name, nodes, req.params.id, req.user.id]);
+        if (updated) res.status(200).json(updated);
+        else res.status(404).json({ message: 'Fluxo não encontrado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao salvar o fluxo.' }); }
+});
+
+app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
+    try {
+        const result = await sqlWithRetry('DELETE FROM flows WHERE id = $1 AND seller_id = $2', [req.params.id, req.user.id]);
+        if (result.count > 0) res.status(204).send();
+        else res.status(404).json({ message: 'Fluxo não encontrado.' });
+    } catch (error) { res.status(500).json({ message: 'Erro ao deletar o fluxo.' }); }
+});
+
+app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
+    try {
+        const users = await sqlWithRetry(`
+            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
+            WHERE bot_id = $1 AND seller_id = $2
+            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
+        res.status(200).json(users);
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
+});
+
+app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        const messages = await sqlWithRetry(`
+            SELECT * FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3 ORDER BY created_at ASC;`, [req.params.botId, req.params.chatId, req.user.id]);
+        res.status(200).json(messages);
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar mensagens.' }); }
+});
+
+app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => {
+    const { chatId, text } = req.body;
+    if (!chatId || !text) return res.status(400).json({ message: 'Chat ID e texto são obrigatórios.' });
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [req.params.botId, req.user.id]);
+        if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
+        
+        const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text });
+        await saveMessageToDb(req.user.id, req.params.botId, sentMessage, 'operator');
+        res.status(200).json({ message: 'Mensagem enviada!' });
+    } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
+});
+
+app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
+    try {
+        await sqlWithRetry('DELETE FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 AND seller_id = $3', [req.params.botId, req.params.chatId, req.user.id]);
+        await sqlWithRetry('DELETE FROM user_flow_states WHERE bot_id = $1 AND chat_id = $2', [req.params.botId, req.params.chatId]);
+        res.status(204).send();
+    } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
+});
 
 // ==========================================================
 //          NOVAS ROTAS PARA A BIBLIOTECA DE MÍDIA
@@ -389,26 +579,30 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         if (!storageBotToken || !storageChannelId) throw new Error('Credenciais do bot de armazenamento não configuradas.');
 
         const buffer = Buffer.from(fileData, 'base64');
-        const formData = new FormData();
-        formData.append('chat_id', storageChannelId);
         
-        const blob = new Blob([buffer], { type: fileType === 'image' ? 'image/jpeg' : 'video/mp4' });
+        // Usar FormData é mais complexo em ambientes serverless sem bibliotecas como 'form-data'.
+        // Uma abordagem mais simples é enviar o buffer diretamente.
         
-        let telegramMethod = '', fieldName = '';
+        let telegramMethod = '', fieldName = '', contentType = '';
         if (fileType === 'image') {
             telegramMethod = 'sendPhoto';
             fieldName = 'photo';
+            contentType = 'image/jpeg';
         } else if (fileType === 'video') {
             telegramMethod = 'sendVideo';
             fieldName = 'video';
+            contentType = 'video/mp4';
         } else {
             return res.status(400).json({ message: 'Tipo de ficheiro não suportado.' });
         }
-        formData.append(fieldName, blob, fileName);
         
-        const response = await sendTelegramRequest(storageBotToken, telegramMethod, formData, { 'Content-Type': `multipart/form-data; boundary=${formData._boundary}` });
+        const url = `https://api.telegram.org/bot${storageBotToken}/${telegramMethod}?chat_id=${storageChannelId}`;
+        
+        const response = await axios.post(url, buffer, {
+            headers: { 'Content-Type': contentType }
+        });
 
-        const result = response;
+        const result = response.data.result;
         const fileId = fileType === 'image' ? result.photo[result.photo.length - 1].file_id : result.video.file_id;
         if (!fileId) throw new Error('Não foi possível obter o file_id do Telegram.');
 
@@ -419,6 +613,7 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
 
         res.status(201).json(newMedia);
     } catch (error) {
+        console.error("Erro no upload de mídia:", error.response?.data || error.message);
         res.status(500).json({ message: 'Erro ao processar o upload do ficheiro.' });
     }
 });
@@ -433,10 +628,55 @@ app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
     }
 });
 
-
 // --- WEBHOOK DO TELEGRAM ---
 app.post('/api/webhook/telegram/:botId', async (req, res) => {
-    // ... (O seu webhook completo, como nas versões anteriores)
+    const { botId } = req.params;
+    const body = req.body;
+    res.sendStatus(200);
+
+    try {
+        const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
+        if (!bot) return;
+
+        if (body.callback_query) {
+            const { message, data } = body.callback_query;
+            const chatId = message.chat.id;
+            await sendTelegramRequest(bot.bot_token, 'answerCallbackQuery', { callback_query_id: body.callback_query.id });
+            const [action, value] = data.split('|');
+            if (action === 'continue_flow' && value) {
+                const userStateResult = await sqlWithRetry('SELECT variables FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                const variables = userStateResult[0]?.variables || {};
+                await processFlow(chatId, botId, bot.bot_token, bot.seller_id, value, variables);
+            }
+            return;
+        }
+
+        if (body.message) {
+            const message = body.message;
+            const chatId = message?.chat?.id;
+            if (!chatId || !message.text) return;
+            
+            await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+            await saveMessageToDb(bot.seller_id, botId, message, 'user');
+            
+            let initialVars = {};
+            if (message.text.startsWith('/start ')) {
+                await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                const fullClickId = message.text; 
+                initialVars.click_id = fullClickId;
+                await sqlWithRetry(`
+                    UPDATE telegram_chats 
+                    SET click_id = $1 
+                    WHERE chat_id = $2 AND message_id = $3;
+                `, [fullClickId, chatId, message.message_id]);
+            }
+            
+            await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
+        }
+
+    } catch (error) {
+        console.error("Erro no Webhook do Telegram:", error);
+    }
 });
 
 module.exports = app;
