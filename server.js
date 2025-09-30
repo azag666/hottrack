@@ -205,13 +205,12 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                             const fileInfoResponse = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
                             if (!fileInfoResponse.ok || !fileInfoResponse.result?.file_path) throw new Error('Não foi possível obter informações do arquivo.');
                             const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfoResponse.result.file_path}`;
-                            
-                            // *** CORREÇÃO APLICADA AQUI ***
-                            // Em vez de baixar e reenviar, apenas enviamos a URL direta do arquivo.
-                            const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileUrl };
-                            if (caption) payload.caption = caption;
-                            response = await sendTelegramRequest(botToken, method, payload);
-
+                            const fileBuffer = await axios.get(fileUrl, { responseType: 'arraybuffer' }).then(res => res.data);
+                            const formData = new FormData();
+                            formData.append('chat_id', chatId);
+                            formData.append(fieldMap[currentNode.type], fileBuffer, { filename: 'mediafile' });
+                            if (caption) formData.append('caption', caption);
+                            response = await sendTelegramRequest(botToken, method, formData, { headers: formData.getHeaders() });
                         } catch (e) {
                             console.error("Erro ao processar arquivo da biblioteca:", e.message);
                         }
@@ -472,11 +471,11 @@ app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
         } else if (fileType.startsWith('video/')) {
             method = 'sendVideo';
             field = 'video';
-        } else if (fileType === 'audio/ogg' || fileType.startsWith('audio/')) {
+        } else if (fileType.startsWith('audio/')) {
             method = 'sendVoice';
             field = 'voice';
         } else {
-            return res.status(400).json({ message: 'Tipo de arquivo não suportado. Para voz, use OGG/Opus.' });
+            return res.status(400).json({ message: 'Tipo de arquivo não suportado.' });
         }
         formData.append(field, buffer, { filename: fileName });
         const response = await sendTelegramRequest(bot.bot_token, method, formData, { headers: formData.getHeaders() });
