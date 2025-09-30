@@ -213,7 +213,21 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             case 'image':
             case 'video':
             case 'audio': {
-                // ... (código inalterado)
+                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio' };
+                const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
+                const fieldMap = { image: 'photo', video: 'video', audio: 'audio' };
+
+                const method = typeMap[currentNode.type];
+                const url = nodeData[urlMap[currentNode.type]];
+                const caption = await replaceVariables(nodeData.caption, variables);
+                
+                if (url) {
+                    await sendTypingAction(chatId, botToken);
+                    const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: url };
+                    if (caption) payload.caption = caption;
+                    await sendTelegramRequest(botToken, method, payload);
+                }
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
 
@@ -239,7 +253,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const valueInCents = nodeData.valueInCents;
                     if (!valueInCents) throw new Error("Valor do PIX não definido no nó do fluxo.");
                     
-                    // CORREÇÃO: Usar o click_id diretamente como ele está nas variáveis.
+                    // CORREÇÃO DEFINITIVA: Usar o click_id completo, sem remover o prefixo.
                     const click_id = variables.click_id;
                     if (!click_id) throw new Error("Click ID não encontrado nas variáveis do fluxo para gerar PIX.");
 
@@ -309,7 +323,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
             case 'action_city': {
                 try {
-                    // CORREÇÃO: Usar o click_id diretamente como ele está nas variáveis.
+                    // CORREÇÃO DEFINITIVA: Usar o click_id completo, sem remover o prefixo.
                     const click_id = variables.click_id;
                     if (!click_id) throw new Error("Click ID não encontrado para consultar cidade.");
 
@@ -334,7 +348,25 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             }
             
             case 'forward_flow': {
-                 // ... (código inalterado)
+                const targetFlowId = nodeData.targetFlowId;
+                console.log(`[Flow Engine] Encaminhando ${chatId} para o fluxo ID ${targetFlowId}`);
+                const [targetFlow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND bot_id = $2', [targetFlowId, botId]);
+                
+                if (targetFlow) {
+                    await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                    
+                    const targetFlowData = typeof targetFlow.nodes === 'string' ? JSON.parse(targetFlow.nodes) : targetFlow.nodes;
+                    const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
+                    
+                    if (startNode) {
+                        currentFlowData = targetFlowData;
+                        nodes = currentFlowData.nodes || [];
+                        edges = currentFlowData.edges || [];
+                        currentNodeId = findNextNode(startNode.id, null, edges);
+                        continue; 
+                    }
+                }
+                currentNodeId = null;
                 break;
             }
 
@@ -487,9 +519,6 @@ app.put('/api/settings/hottrack-key', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao salvar a chave.' });
     }
 });
-
-// ... (Resto das suas rotas de API, como /api/bots, /api/flows, etc., permanecem inalteradas)
-// Cole o restante do seu arquivo original aqui.
 
 app.post('/api/bots', authenticateJwt, async (req, res) => {
     const { bot_name } = req.body;
