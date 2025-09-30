@@ -21,7 +21,12 @@ const sql = neon(process.env.DATABASE_URL);
 async function sqlWithRetry(query, params = [], retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
-            return await sql(query, params);
+            // Se a query for uma string literal (template string), execute-a diretamente.
+            if (typeof query === 'string') {
+                return await sql(query, params);
+            }
+            // Se for um template literal taggeado, chame-o como uma função.
+            return await query;
         } catch (error) {
             const isRetryable = error.message.includes('fetch failed') || (error.sourceError && error.sourceError.code === 'UND_ERR_SOCKET');
             if (isRetryable && i < retries - 1) {
@@ -250,16 +255,21 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const valueInCents = nodeData.valueInCents;
                     if (!valueInCents) throw new Error("Valor do PIX não definido no nó do fluxo.");
                     
-                    const click_id = variables.click_id;
-                    if (!click_id) throw new Error("Click ID não encontrado nas variáveis do fluxo para gerar PIX.");
+                    const click_id_raw = variables.click_id;
+                    if (!click_id_raw) throw new Error("Click ID não encontrado nas variáveis do fluxo para gerar PIX.");
                     
-                    const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/pix/generate';
-                    const [seller] = await sqlWithRetry('SELECT api_key FROM sellers WHERE id = $1', [sellerId]);
-                    if (!seller) throw new Error("API Key do vendedor não encontrada.");
+                    const click_id = click_id_raw.startsWith('/start ') ? click_id_raw.substring(7).trim() : click_id_raw.trim();
 
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) {
+                        throw new Error("A Chave de API do HotTrack não está configurada. Vá para a página de Integrações.");
+                    }
+
+                    const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/pix/generate';
+                    console.log(`[Flow Engine] Chamando API HotTrack para gerar PIX para o click_id: ${click_id}`);
                     const response = await axios.post(hottrackApiUrl, 
                         { click_id, value_cents: valueInCents },
-                        { headers: { 'x-api-key': seller.api_key } }
+                        { headers: { 'x-api-key': seller.hottrack_api_key } }
                     );
 
                     const pixResult = response.data;
@@ -272,8 +282,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
 
                 } catch (error) {
-                    console.error("[Flow Engine] Erro ao gerar PIX:", error.response?.data || error.message);
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Desculpe, não consegui gerar o PIX neste momento. Tente novamente mais tarde." });
+                    console.error("[Flow Engine] Erro ao gerar PIX via API HotTrack:", error.response?.data || error.message);
+                    const errorMessage = error.response?.data?.message || "Desculpe, não consegui gerar o PIX neste momento. Verifique suas configurações ou tente mais tarde.";
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                     await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
@@ -285,11 +296,14 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const transactionId = variables.last_transaction_id;
                     if (!transactionId) throw new Error("Nenhum ID de transação PIX encontrado para consultar.");
 
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) {
+                        throw new Error("A Chave de API do HotTrack não está configurada. Vá para a página de Integrações.");
+                    }
+                    
                     const hottrackApiUrl = `https://novaapi-one.vercel.app/api/pix/status/${transactionId}`;
-                    const [seller] = await sqlWithRetry('SELECT api_key FROM sellers WHERE id = $1', [sellerId]);
-                    if (!seller) throw new Error("API Key do vendedor não encontrada.");
-
-                    const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.api_key } });
+                    console.log(`[Flow Engine] Chamando API HotTrack para consultar status do PIX: ${transactionId}`);
+                    const response = await axios.get(hottrackApiUrl, { headers: { 'x-api-key': seller.hottrack_api_key } });
                     
                     if (response.data.status === 'paid') {
                         const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Pagamento confirmado! ✅" });
@@ -301,8 +315,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                         currentNodeId = findNextNode(currentNodeId, 'b', edges);
                     }
                 } catch (error) {
-                     console.error("[Flow Engine] Erro ao consultar PIX:", error.response?.data || error.message);
-                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: "Não consegui consultar o status do PIX agora." });
+                     console.error("[Flow Engine] Erro ao consultar PIX via API HotTrack:", error.response?.data || error.message);
+                     const errorMessage = error.response?.data?.message || "Não consegui consultar o status do PIX agora.";
+                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                      await saveMessageToDb(sellerId, botId, sentMessage, 'bot');
                      currentNodeId = findNextNode(currentNodeId, 'b', edges);
                 }
@@ -311,14 +326,16 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
 
             case 'action_city': {
                 try {
-                    const click_id = variables.click_id;
-                    if (!click_id) throw new Error("Click ID não encontrado para consultar cidade.");
+                    const click_id_raw = variables.click_id;
+                    if (!click_id_raw) throw new Error("Click ID não encontrado para consultar cidade.");
+                    
+                    const click_id = click_id_raw.startsWith('/start ') ? click_id_raw.substring(7).trim() : click_id_raw.trim();
+
+                    const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                    if (!seller || !seller.hottrack_api_key) throw new Error("API Key do HotTrack do vendedor não encontrada.");
 
                     const hottrackApiUrl = 'https://novaapi-one.vercel.app/api/click/info';
-                    const [seller] = await sqlWithRetry('SELECT api_key FROM sellers WHERE id = $1', [sellerId]);
-                     if (!seller) throw new Error("API Key do vendedor não encontrada.");
-
-                    const response = await axios.post(hottrackApiUrl, { click_id }, { headers: { 'x-api-key': seller.api_key } });
+                    const response = await axios.post(hottrackApiUrl, { click_id }, { headers: { 'x-api-key': seller.hottrack_api_key } });
                     
                     variables.city = response.data.city || 'Desconhecida';
                     variables.state = response.data.state || 'Desconhecido';
@@ -346,12 +363,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const startNode = (targetFlowData.nodes || []).find(n => n.type === 'trigger');
                     
                     if (startNode) {
-                        // Lógica iterativa para evitar recursão e estouro de pilha
                         currentFlowData = targetFlowData;
                         nodes = currentFlowData.nodes || [];
                         edges = currentFlowData.edges || [];
                         currentNodeId = findNextNode(startNode.id, null, edges);
-                        // Continua para a próxima iteração do loop 'while' com o novo fluxo
                         continue; 
                     }
                 }
@@ -388,17 +403,11 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
             console.log(`[CRON] Encontrados ${pendingTimeouts.length} jobs agendados para processar.`);
             
             for (const timeout of pendingTimeouts) {
-                // Deleta o job antes de processar para evitar re-execução em caso de falha
                 await sqlWithRetry('DELETE FROM flow_timeouts WHERE id = $1', [timeout.id]);
                 
-                // Verifica se o usuário ainda está em um fluxo ativo. 
-                // Se o usuário interagiu, o estado pode ter sido limpo, e não devemos prosseguir.
                 const userStateResult = await sqlWithRetry('SELECT waiting_for_input FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [timeout.chat_id, timeout.bot_id]);
                 const userState = userStateResult[0];
 
-                // A condição agora é: o estado do usuário AINDA EXISTE?
-                // E, se for um timeout de resposta, o usuário ainda está esperando?
-                // Para um delay, userState.waiting_for_input será false, então a segunda parte da condição é ignorada.
                 const isReplyTimeout = userState && userState.waiting_for_input;
                 const isScheduledDelay = userState && !userState.waiting_for_input;
 
@@ -488,10 +497,30 @@ app.post('/api/sellers/login', async (req, res) => {
 
 app.get('/api/dashboard/data', authenticateJwt, async (req, res) => {
     try {
-        const bots = await sqlWithRetry('SELECT * FROM telegram_bots WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
-        res.json({ bots });
+        const botsPromise = sqlWithRetry('SELECT * FROM telegram_bots WHERE seller_id = $1 ORDER BY created_at DESC', [req.user.id]);
+        const settingsPromise = sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [req.user.id]);
+
+        const [bots, settingsResult] = await Promise.all([botsPromise, settingsPromise]);
+        
+        const settings = settingsResult[0] || {};
+
+        res.json({ bots, settings });
     } catch (error) {
         res.status(500).json({ message: 'Erro ao buscar dados.' });
+    }
+});
+
+app.put('/api/settings/hottrack-key', authenticateJwt, async (req, res) => {
+    const { apiKey } = req.body;
+    if (typeof apiKey === 'undefined') {
+        return res.status(400).json({ message: 'O campo apiKey é obrigatório.' });
+    }
+    try {
+        await sqlWithRetry('UPDATE sellers SET hottrack_api_key = $1 WHERE id = $2', [apiKey, req.user.id]);
+        res.status(200).json({ message: 'Chave de API do HotTrack salva com sucesso!' });
+    } catch (error) {
+        console.error("Erro ao salvar a chave de API do HotTrack:", error);
+        res.status(500).json({ message: 'Erro ao salvar a chave.' });
     }
 });
 
@@ -532,7 +561,7 @@ app.post('/api/bots/:id/set-webhook', authenticateJwt, async (req, res) => {
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [id, req.user.id]);
         if (!bot || !bot.bot_token) return res.status(400).json({ message: 'Token do bot não configurado.' });
         
-        const webhookUrl = `https://hottrack.vercel.app/api/webhook/telegram/${id}`;
+        const webhookUrl = `https://hotbot.vercel.app/api/webhook/telegram/${id}`; // **ATENÇÃO: VERIFIQUE SE ESTA URL ESTÁ CORRETA PARA O SEU DEPLOY DO HOTBOT**
         await sendTelegramRequest(bot.bot_token, 'setWebhook', { url: webhookUrl });
         res.status(200).json({ message: 'Webhook configurado com sucesso!' });
     } catch (error) {
@@ -670,7 +699,6 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         const chatId = message?.chat?.id;
         if (!chatId || !message.text) return;
         
-        // Limpa todos os timeouts/delays pendentes para este usuário, pois ele interagiu.
         await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
 
         const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
@@ -679,13 +707,12 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
         await saveMessageToDb(bot.seller_id, botId, message, 'user');
         
         let initialVars = {};
-        // Se a mensagem é um /start, reseta o estado do fluxo para garantir um início limpo.
         if (message.text.startsWith('/start ')) {
             console.log(`[Webhook] Comando /start recebido para ${chatId}. Resetando estado do fluxo.`);
             await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
             
             const fullClickId = message.text; 
-            initialVars.click_id = message.text.substring(7).trim();
+            initialVars.click_id = fullClickId; // Passa o click_id com '/start '
             
             await sqlWithRetry(`
                 UPDATE telegram_chats 
