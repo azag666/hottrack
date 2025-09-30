@@ -64,7 +64,7 @@ async function sendTelegramRequest(botToken, method, data, options = {}) {
     }
 }
 
-// CORRIGIDO: Lógica de salvamento refeita para ser compatível com a chave primária
+// CORRIGIDO: Lógica de salvamento refeita para inserir CADA mensagem
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video } = message;
     let mediaType = null;
@@ -95,7 +95,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         ON CONFLICT (chat_id, message_id) DO NOTHING;
     `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId]);
 
-    // 2. Se um click_id foi recebido, atualiza todas as entradas para esse chat
+    // 2. Se um click_id foi recebido, atualiza o click_id para o chat
     if (clickId) {
         await sqlWithRetry(
             'UPDATE telegram_chats SET click_id = $1 WHERE chat_id = $2 AND bot_id = $3',
@@ -103,6 +103,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         );
     }
 }
+
 
 async function replaceVariables(text, variables) {
     if (!text) return '';
@@ -415,9 +416,9 @@ app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
 app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     try {
         const users = await sqlWithRetry(`
-            SELECT DISTINCT ON (bot_id, chat_id) * FROM telegram_chats 
+            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
             WHERE bot_id = $1 AND seller_id = $2
-            ORDER BY bot_id, chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
+            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
         res.status(200).json(users);
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
 });
