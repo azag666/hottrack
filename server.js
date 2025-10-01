@@ -711,53 +711,83 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
     }
 });
 
-// NOVA ROTA PARA IMPORTAR CONTATOS
-app.post('/api/bots/import-contacts', authenticateJwt, async (req, res) => {
-    const { sourceBotId, destinationBotId } = req.body;
-    const sellerId = req.user.id;
+// --- NOVAS ROTAS PARA IMPORTAÇÃO DE CONTATOS ---
+const NOVA_API_URL = 'https://novaapi-one.vercel.app/api';
 
-    if (!sourceBotId || !destinationBotId) {
-        return res.status(400).json({ message: 'Bot de origem e de destino são obrigatórios.' });
-    }
-    if (sourceBotId === destinationBotId) {
-        return res.status(400).json({ message: 'O bot de origem e destino não podem ser os mesmos.' });
+app.post('/api/novaapi/connect', authenticateJwt, async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+        return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
     }
 
     try {
-        const bots = await sqlWithRetry('SELECT id FROM telegram_bots WHERE id = ANY($1) AND seller_id = $2', [[sourceBotId, destinationBotId], sellerId]);
-        if (bots.length !== 2) {
-            return res.status(403).json({ message: 'Um ou ambos os bots não foram encontrados ou não pertencem a você.' });
+        const loginResponse = await axios.post(`${NOVA_API_URL}/sellers/login`, { email, password });
+        const token = loginResponse.data.token;
+
+        if (!token) {
+            throw new Error('Token não recebido da Nova API.');
         }
+        
+        const dashboardResponse = await axios.get(`${NOVA_API_URL}/dashboard/data`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        res.status(200).json({
+            message: 'Conectado com sucesso!',
+            token: token,
+            bots: dashboardResponse.data.bots || []
+        });
 
-        const sourceContacts = await sqlWithRetry(`
-            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
-            WHERE bot_id = $1 AND seller_id = $2
-            ORDER BY chat_id, created_at DESC;
-        `, [sourceBotId, sellerId]);
+    } catch (error) {
+        console.error("Erro ao conectar com a Nova API:", error.response?.data || error.message);
+        const status = error.response?.status || 500;
+        const message = error.response?.data?.message || 'Falha ao conectar. Verifique suas credenciais.';
+        res.status(status).json({ message });
+    }
+});
 
-        if (sourceContacts.length === 0) {
-            return res.status(404).json({ message: 'Nenhum contato encontrado no bot de origem.' });
+app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
+    const { sourceBotId, destinationBotId, novaApiToken } = req.body;
+    const sellerId = req.user.id;
+
+    if (!sourceBotId || !destinationBotId || !novaApiToken) {
+        return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
+    }
+
+    try {
+        const { data: sourceContacts } = await axios.get(`${NOVA_API_URL}/chats/${sourceBotId}`, {
+            headers: { 'Authorization': `Bearer ${novaApiToken}` }
+        });
+
+        if (!sourceContacts || sourceContacts.length === 0) {
+            return res.status(404).json({ message: 'Nenhum contato encontrado no bot de origem da Nova API.' });
         }
 
         let importedCount = 0;
         for (const contact of sourceContacts) {
-            const result = await sqlWithRetry(`
+             const result = await sqlWithRetry(`
                 INSERT INTO telegram_chats 
-                    (seller_id, bot_id, chat_id, user_id, first_name, last_name, username, click_id, message_text, sender_type)
+                    (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, click_id, message_text, sender_type)
                 VALUES 
-                    ($1, $2, $3, $4, $5, $6, $7, $8, 'Contato importado', 'user')
-                ON CONFLICT (chat_id, bot_id) DO NOTHING;
-            `, [sellerId, destinationBotId, contact.chat_id, contact.user_id, contact.first_name, contact.last_name, contact.username, contact.click_id]);
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Contato importado via Nova API', 'user')
+                ON CONFLICT (bot_id, chat_id) DO NOTHING;
+            `, [
+                sellerId, destinationBotId, contact.chat_id, (contact.message_id || Date.now()), contact.user_id, 
+                contact.first_name, contact.last_name, contact.username, contact.click_id
+            ]);
+            
             if (result.count > 0) {
                 importedCount++;
             }
         }
-
+        
         res.status(200).json({ message: `Importação concluída! ${importedCount} novos contatos foram adicionados.` });
 
     } catch (error) {
-        console.error("Erro ao importar contatos:", error);
-        res.status(500).json({ message: 'Ocorreu um erro interno durante a importação.' });
+        console.error("Erro durante a importação de contatos da Nova API:", error.response?.data || error.message);
+        const status = error.response?.status || 500;
+        const message = error.response?.data?.message || 'Falha ao importar contatos.';
+        res.status(status).json({ message });
     }
 });
 
