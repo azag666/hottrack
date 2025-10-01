@@ -9,6 +9,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const FormData = require('form-data');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -17,6 +19,11 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+
+// Agentes HTTP/HTTPS para reutilização de conexão (melhora a performance)
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true });
+
 
 const sql = neon(process.env.DATABASE_URL);
 
@@ -56,22 +63,46 @@ function findNextNode(currentNodeId, handleId, edges) {
     return edge ? edge.target : null;
 }
 
-async function sendTelegramRequest(botToken, method, data, options = {}) {
+// ==========================================================
+//          [ATUALIZADO] FUNÇÃO DE ENVIO PARA TELEGRAM COM RETRY E TIMEOUT
+// ==========================================================
+async function sendTelegramRequest(botToken, method, data, options = {}, retries = 3, delay = 1500) {
     const { headers = {}, responseType = 'json' } = options;
-    try {
-        const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
-        const response = await axios.post(apiUrl, data, { headers, responseType });
-        return response.data;
-    } catch (error) {
-        const errorData = error.response?.data;
-        const errorMessage = (errorData instanceof ArrayBuffer) 
-            ? JSON.parse(Buffer.from(errorData).toString('utf8'))
-            : errorData;
-        
-        console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, errorMessage || error.message);
-        throw error;
+    const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
+
+    for (let i = 0; i < retries; i++) {
+        try {
+            const response = await axios.post(apiUrl, data, {
+                headers,
+                responseType,
+                httpAgent, // Reutiliza conexões HTTP
+                httpsAgent, // Reutiliza conexões HTTPS
+                timeout: 10000 // Timeout de 10 segundos
+            });
+            return response.data;
+        } catch (error) {
+            const isRetryable = error.code === 'ECONNABORTED' || // Timeout
+                                error.code === 'ECONNRESET' ||   // Conexão resetada
+                                error.message.includes('socket hang up');
+
+            if (isRetryable && i < retries - 1) {
+                // Se o erro permite nova tentativa, aguarda um pouco e tenta de novo
+                await new Promise(res => setTimeout(res, delay * (i + 1))); // Aumenta o delay a cada tentativa
+                continue;
+            }
+
+            // Se não for um erro "tentável" ou se as tentativas acabaram, lança o erro
+            const errorData = error.response?.data;
+            const errorMessage = (errorData instanceof ArrayBuffer)
+                ? JSON.parse(Buffer.from(errorData).toString('utf8'))
+                : errorData;
+
+            console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, errorMessage || error.message);
+            throw error;
+        }
     }
 }
+
 
 async function saveMessageToDb(sellerId, botId, message, senderType) {
     const { message_id, chat, from, text, photo, video, voice } = message;
