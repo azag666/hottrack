@@ -1020,7 +1020,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
     try {
         const [history] = await sqlWithRetry(
-            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id`,
+            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status, total_sent) VALUES ($1, $2, $3, $4, 'PENDING', 0) RETURNING id`,
             [sellerId, campaignName, JSON.stringify(botIds), JSON.stringify(flowSteps)]
         );
         const historyId = history.id;
@@ -1050,7 +1050,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
             }
         }
         
-        await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING', total_sent = 0 WHERE id = $1`, [historyId]);
+        await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING' WHERE id = $1`, [historyId]);
 
         res.status(202).json({ message: `Disparo "${campaignName}" agendado com sucesso! O processo ocorrerá em segundo plano.` });
 
@@ -1200,29 +1200,28 @@ app.get('/api/cron/process-disparo-queue', async (req, res) => {
                 console.error(`Falha ao processar job ${id} para chat ${chat_id}: ${e.message}`);
             }
 
+            // Apenas adiciona ao log; não atualiza mais o total_sent aqui
             await sqlWithRetry(
                 `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
                 [history_id, chat_id, bot_id, logStatus, lastTransactionId]
             );
 
             if (logStatus !== 'FAILED') {
+                // Atualiza o contador de envios na tabela principal do histórico
                 await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [history_id]);
             }
 
-            // Deleta o job da fila após o processamento (bem-sucedido ou falho)
+            // Deleta o job da fila após o processamento
             await sqlWithRetry(`DELETE FROM disparo_queue WHERE id = $1`, [id]);
             processedCount++;
         }
 
         // Verifica se a fila está vazia para finalizar a campanha
-        const remainingJobs = await sqlWithRetry(`SELECT id FROM disparo_queue LIMIT 1`);
-        if(remainingJobs.length === 0) {
-            const runningCampaigns = await sqlWithRetry(`SELECT id FROM disparo_history WHERE status = 'RUNNING'`);
-            for(const campaign of runningCampaigns) {
-                const remainingInQueue = await sqlWithRetry(`SELECT id FROM disparo_queue WHERE history_id = $1 LIMIT 1`, [campaign.id]);
-                if(remainingInQueue.length === 0) {
-                    await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [campaign.id]);
-                }
+        const runningCampaigns = await sqlWithRetry(`SELECT id FROM disparo_history WHERE status = 'RUNNING'`);
+        for(const campaign of runningCampaigns) {
+            const remainingInQueue = await sqlWithRetry(`SELECT id FROM disparo_queue WHERE history_id = $1 LIMIT 1`, [campaign.id]);
+            if(remainingInQueue.length === 0) {
+                await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [campaign.id]);
             }
         }
         
