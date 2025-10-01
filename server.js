@@ -802,7 +802,7 @@ app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
     }
 });
 
-// --- NOVAS ROTAS PARA COMPARTILHAMENTO DE FLUXOS ---
+// --- ROTAS DE COMPARTILHAMENTO DE FLUXOS ATUALIZADAS ---
 
 app.post('/api/flows/:id/share', authenticateJwt, async (req, res) => {
     const { id } = req.params;
@@ -860,30 +860,66 @@ app.post('/api/shared-flows/:id/import', authenticateJwt, async (req, res) => {
     }
 });
 
+// [NOVO] ROTA ATUALIZADA PARA GERAR LINK COM OPÇÕES AVANÇADAS
 app.post('/api/flows/:id/generate-share-link', authenticateJwt, async (req, res) => {
     const { id } = req.params;
     const sellerId = req.user.id;
+    const { priceInCents, allowReshare, bundleLinkedFlows, bundleMedia } = req.body;
+
     try {
         const shareId = uuidv4();
         const [updatedFlow] = await sqlWithRetry(
-            `UPDATE flows SET shareable_link_id = $1 WHERE id = $2 AND seller_id = $3 RETURNING shareable_link_id`,
-            [shareId, id, sellerId]
+            `UPDATE flows SET 
+                shareable_link_id = $1,
+                share_price_cents = $2,
+                share_allow_reshare = $3,
+                share_bundle_linked_flows = $4,
+                share_bundle_media = $5
+             WHERE id = $6 AND seller_id = $7 RETURNING shareable_link_id`,
+            [shareId, priceInCents || 0, !!allowReshare, !!bundleLinkedFlows, !!bundleMedia, id, sellerId]
         );
         if (!updatedFlow) return res.status(404).json({ message: 'Fluxo não encontrado.' });
         res.status(200).json({ shareable_link_id: updatedFlow.shareable_link_id });
     } catch (error) {
+        console.error("Erro ao gerar link de compartilhamento:", error);
         res.status(500).json({ message: 'Erro ao gerar link de compartilhamento.' });
     }
 });
 
+// [NOVO] ROTA PARA OBTER DETALHES DE UM FLUXO COMPARTILHADO ANTES DE IMPORTAR
+app.get('/api/share/details/:shareId', async (req, res) => {
+    try {
+        const { shareId } = req.params;
+        const [flow] = await sqlWithRetry(`
+            SELECT name, share_price_cents, share_allow_reshare, share_bundle_linked_flows, share_bundle_media
+            FROM flows WHERE shareable_link_id = $1
+        `, [shareId]);
+
+        if (!flow) {
+            return res.status(404).json({ message: 'Link de compartilhamento inválido ou não encontrado.' });
+        }
+
+        res.status(200).json(flow);
+    } catch (error) {
+        console.error("Erro ao buscar detalhes do compartilhamento:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+});
+
+
+// [NOVO] ROTA ATUALIZADA PARA IMPORTAR APENAS FLUXOS GRATUITOS
 app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
     const { shareableLinkId, botId } = req.body;
     const sellerId = req.user.id;
     try {
         if (!botId || !shareableLinkId) return res.status(400).json({ message: 'ID do link e ID do bot são obrigatórios.' });
         
-        const [originalFlow] = await sqlWithRetry('SELECT name, nodes FROM flows WHERE shareable_link_id = $1', [shareableLinkId]);
+        const [originalFlow] = await sqlWithRetry('SELECT name, nodes, share_price_cents FROM flows WHERE shareable_link_id = $1', [shareableLinkId]);
         if (!originalFlow) return res.status(404).json({ message: 'Link de compartilhamento inválido ou expirado.' });
+
+        if (originalFlow.share_price_cents > 0) {
+            return res.status(400).json({ message: 'Este fluxo é pago e não pode ser importado por esta via.' });
+        }
 
         const newFlowName = `${originalFlow.name} (Importado)`;
         const [newFlow] = await sqlWithRetry(
@@ -892,6 +928,7 @@ app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
         );
         res.status(201).json(newFlow);
     } catch (error) {
+        console.error("Erro ao importar fluxo por link:", error);
         res.status(500).json({ message: 'Erro ao importar fluxo por link: ' + error.message });
     }
 });
