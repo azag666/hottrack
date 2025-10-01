@@ -63,9 +63,6 @@ function findNextNode(currentNodeId, handleId, edges) {
     return edge ? edge.target : null;
 }
 
-// ==========================================================
-//          [ATUALIZADO] FUNÇÃO DE ENVIO PARA TELEGRAM COM RETRY E TIMEOUT
-// ==========================================================
 async function sendTelegramRequest(botToken, method, data, options = {}, retries = 3, delay = 1500) {
     const { headers = {}, responseType = 'json' } = options;
     const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
@@ -75,23 +72,19 @@ async function sendTelegramRequest(botToken, method, data, options = {}, retries
             const response = await axios.post(apiUrl, data, {
                 headers,
                 responseType,
-                httpAgent, // Reutiliza conexões HTTP
-                httpsAgent, // Reutiliza conexões HTTPS
-                timeout: 10000 // Timeout de 10 segundos
+                httpAgent,
+                httpsAgent,
+                timeout: 15000 // Aumentado para 15 segundos para mídias
             });
             return response.data;
         } catch (error) {
-            const isRetryable = error.code === 'ECONNABORTED' || // Timeout
-                                error.code === 'ECONNRESET' ||   // Conexão resetada
-                                error.message.includes('socket hang up');
+            const isRetryable = error.code === 'ECONNABORTED' || error.code === 'ECONNRESET' || error.message.includes('socket hang up');
 
             if (isRetryable && i < retries - 1) {
-                // Se o erro permite nova tentativa, aguarda um pouco e tenta de novo
-                await new Promise(res => setTimeout(res, delay * (i + 1))); // Aumenta o delay a cada tentativa
+                await new Promise(res => setTimeout(res, delay * (i + 1)));
                 continue;
             }
-
-            // Se não for um erro "tentável" ou se as tentativas acabaram, lança o erro
+            
             const errorData = error.response?.data;
             const errorMessage = (errorData instanceof ArrayBuffer)
                 ? JSON.parse(Buffer.from(errorData).toString('utf8'))
@@ -167,7 +160,6 @@ async function replaceVariables(text, variables) {
     return processedText;
 }
 
-// Função auxiliar para enviar mídia via proxy
 async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, caption) {
     const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
     if (!storageBotToken) throw new Error('Token do bot de armazenamento não configurado.');
@@ -198,6 +190,47 @@ async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, c
     formData.append(field, fileBuffer, { filename: fileName, contentType: fileHeaders['content-type'] });
 
     return await sendTelegramRequest(destinationBotToken, method, formData, { headers: formData.getHeaders() });
+}
+
+// ==========================================================
+//          [NOVO] FUNÇÃO CENTRALIZADA PARA NÓS DE MÍDIA
+// ==========================================================
+async function handleMediaNode(node, botToken, chatId, caption) {
+    const type = node.type;
+    const nodeData = node.data || {};
+    const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
+    const fileIdentifier = nodeData[urlMap[type]];
+
+    if (!fileIdentifier) {
+        console.warn(`[Flow Media] Nenhum file_id ou URL fornecido para o nó de ${type} ${node.id}`);
+        return null;
+    }
+
+    const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
+    let response;
+
+    if (isLibraryFile) {
+        if (type === 'audio') {
+            const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
+            if (duration > 0) {
+                await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
+                await new Promise(resolve => setTimeout(resolve, duration * 1000));
+            }
+        }
+        response = await sendMediaAsProxy(botToken, chatId, fileIdentifier, type, caption);
+    } else {
+        // Lógica para URL externa
+        const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+        const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+        
+        const method = methodMap[type];
+        const field = fieldMap[type];
+        
+        const payload = { chat_id: chatId, [field]: fileIdentifier, caption };
+        response = await sendTelegramRequest(botToken, method, payload);
+    }
+    
+    return response;
 }
 
 
@@ -253,9 +286,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
     }
 
     let safetyLock = 0;
-    // ==========================================================
-    //          [CORREÇÃO] Flag para controlar a limpeza de estado
-    // ==========================================================
     let shouldCleanup = true; 
 
     while (currentNodeId && safetyLock < 20) {
@@ -297,46 +327,25 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     if (noReplyNodeId) {
                         await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                     }
-                    shouldCleanup = false; // [CORREÇÃO] Impede a limpeza do estado
+                    shouldCleanup = false;
                     currentNodeId = null;
                 } else {
                     currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 }
                 break;
             }
-            case 'image': case 'video': case 'audio': {
-                const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
-                let fileIdentifier = nodeData[urlMap[currentNode.type]];
-                const caption = await replaceVariables(nodeData.caption, variables);
-                
-                if (fileIdentifier) {
-                    const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
-                    
-                    try {
-                        let response;
-                        if (isLibraryFile) {
-                            if (currentNode.type === 'audio') {
-                                const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
-                                if (duration > 0) {
-                                    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
-                                    await new Promise(resolve => setTimeout(resolve, duration * 1000));
-                                }
-                            }
-                            response = await sendMediaAsProxy(botToken, chatId, fileIdentifier, currentNode.type, caption);
-                        } else {
-                            // Lógica para URL externa
-                            const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
-                            const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
-                            const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier, caption };
-                            response = await sendTelegramRequest(botToken, methodMap[currentNode.type], payload);
-                        }
+            case 'image':
+            case 'video':
+            case 'audio': {
+                try {
+                    const caption = await replaceVariables(nodeData.caption, variables);
+                    const response = await handleMediaNode(currentNode, botToken, chatId, caption);
 
-                        if (response && response.ok) {
-                            await saveMessageToDb(sellerId, botId, response.result, 'bot');
-                        }
-                    } catch(e) {
-                         console.error(`Erro ao enviar mídia no fluxo: ${e.message}`);
+                    if (response && response.ok) {
+                        await saveMessageToDb(sellerId, botId, response.result, 'bot');
                     }
+                } catch (e) {
+                    console.error(`[Flow Media] Erro ao enviar mídia no nó ${currentNode.id} para o chat ${chatId}: ${e.message}`);
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
@@ -347,7 +356,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 if (nextNodeId) {
                     await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                 }
-                shouldCleanup = false; // [CORREÇÃO] Impede a limpeza do estado
+                shouldCleanup = false;
                 currentNodeId = null; 
                 break;
             }
@@ -435,10 +444,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         }
         safetyLock++;
     }
-
-    // ==========================================================
-    //          [CORREÇÃO] Limpa o estado apenas se o fluxo realmente terminou
-    // ==========================================================
+    
     if (shouldCleanup && !currentNodeId) {
         if (userState) {
             await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
