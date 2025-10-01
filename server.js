@@ -347,6 +347,48 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
+            // ==========================================================
+            //          [NOVO] NÓ DE VERIFICAÇÃO DE PIX
+            // ==========================================================
+            case 'action_check_pix': {
+                let nextNodeId;
+                try {
+                    // Verifica se existe uma ID de transação salva nas variáveis do usuário
+                    if (!variables.last_transaction_id) {
+                        console.warn(`[Flow Check PIX] Nenhuma 'last_transaction_id' encontrada para o chat ${chatId}`);
+                        // Se não houver ID, segue o caminho de "Pendente" (handle 'b')
+                        nextNodeId = findNextNode(currentNodeId, 'b', edges);
+                    } else {
+                        // Busca a chave de API do vendedor
+                        const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+                        if (!seller || !seller.hottrack_api_key) {
+                            throw new Error("A chave de API do HotTrack não está configurada para este vendedor.");
+                        }
+
+                        // Faz a requisição para a API para verificar o status do PIX
+                        const response = await axios.get(`https://novaapi-one.vercel.app/api/pix/status/${variables.last_transaction_id}`, {
+                            headers: { 'x-api-key': seller.hottrack_api_key }
+                        });
+
+                        // Se a resposta da API indicar que o status é 'PAID' (pago)
+                        if (response.data && response.data.status === 'PAID') {
+                            // Segue o caminho de "Pago" (handle 'a')
+                            nextNodeId = findNextNode(currentNodeId, 'a', edges);
+                        } else {
+                            // Para qualquer outro status ('pending', etc.), segue o caminho de "Pendente" (handle 'b')
+                            nextNodeId = findNextNode(currentNodeId, 'b', edges);
+                        }
+                    }
+                } catch (error) {
+                    // Em caso de erro na API (ex: PIX não encontrado, erro de autenticação)
+                    console.error(`[Flow Check PIX] Erro ao verificar o status do PIX para o chat ${chatId}:`, error.response?.data || error.message);
+                    // Segue o caminho de "Pendente" (handle 'b') como padrão de segurança
+                    nextNodeId = findNextNode(currentNodeId, 'b', edges);
+                }
+                // Define o próximo nó do fluxo
+                currentNodeId = nextNodeId;
+                break;
+            }
              case 'forward_flow': {
                 const targetFlowId = nodeData.targetFlowId;
                 if (targetFlowId) {
