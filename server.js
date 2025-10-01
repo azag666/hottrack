@@ -703,4 +703,54 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
     }
 });
 
+// NOVA ROTA PARA IMPORTAR CONTATOS
+app.post('/api/bots/import-contacts', authenticateJwt, async (req, res) => {
+    const { sourceBotId, destinationBotId } = req.body;
+    const sellerId = req.user.id;
+
+    if (!sourceBotId || !destinationBotId) {
+        return res.status(400).json({ message: 'Bot de origem e de destino são obrigatórios.' });
+    }
+    if (sourceBotId === destinationBotId) {
+        return res.status(400).json({ message: 'O bot de origem e destino não podem ser os mesmos.' });
+    }
+
+    try {
+        const bots = await sqlWithRetry('SELECT id FROM telegram_bots WHERE id = ANY($1) AND seller_id = $2', [[sourceBotId, destinationBotId], sellerId]);
+        if (bots.length !== 2) {
+            return res.status(403).json({ message: 'Um ou ambos os bots não foram encontrados ou não pertencem a você.' });
+        }
+
+        const sourceContacts = await sqlWithRetry(`
+            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
+            WHERE bot_id = $1 AND seller_id = $2
+            ORDER BY chat_id, created_at DESC;
+        `, [sourceBotId, sellerId]);
+
+        if (sourceContacts.length === 0) {
+            return res.status(404).json({ message: 'Nenhum contato encontrado no bot de origem.' });
+        }
+
+        let importedCount = 0;
+        for (const contact of sourceContacts) {
+            const result = await sqlWithRetry(`
+                INSERT INTO telegram_chats 
+                    (seller_id, bot_id, chat_id, user_id, first_name, last_name, username, click_id, message_text, sender_type)
+                VALUES 
+                    ($1, $2, $3, $4, $5, $6, $7, $8, 'Contato importado', 'user')
+                ON CONFLICT (chat_id, bot_id) DO NOTHING;
+            `, [sellerId, destinationBotId, contact.chat_id, contact.user_id, contact.first_name, contact.last_name, contact.username, contact.click_id]);
+            if (result.count > 0) {
+                importedCount++;
+            }
+        }
+
+        res.status(200).json({ message: `Importação concluída! ${importedCount} novos contatos foram adicionados.` });
+
+    } catch (error) {
+        console.error("Erro ao importar contatos:", error);
+        res.status(500).json({ message: 'Ocorreu um erro interno durante a importação.' });
+    }
+});
+
 module.exports = app;
