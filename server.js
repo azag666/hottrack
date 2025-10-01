@@ -136,6 +136,40 @@ async function replaceVariables(text, variables) {
     return processedText;
 }
 
+// Função auxiliar para enviar mídia via proxy
+async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, caption) {
+    const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
+    if (!storageBotToken) throw new Error('Token do bot de armazenamento não configurado.');
+
+    const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileId });
+    if (!fileInfo.ok) throw new Error('Não foi possível obter informações do arquivo da biblioteca.');
+
+    const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.result.file_path}`;
+
+    const { data: fileBuffer, headers: fileHeaders } = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    
+    const formData = new FormData();
+    formData.append('chat_id', chatId);
+    if (caption) {
+        formData.append('caption', caption);
+    }
+
+    const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+    const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+    const fileNameMap = { image: 'image.jpg', video: 'video.mp4', audio: 'audio.ogg' };
+
+    const method = methodMap[fileType];
+    const field = fieldMap[fileType];
+    const fileName = fileNameMap[fileType];
+
+    if (!method) throw new Error('Tipo de arquivo não suportado.');
+
+    formData.append(field, fileBuffer, { filename: fileName, contentType: fileHeaders['content-type'] });
+
+    return await sendTelegramRequest(destinationBotToken, method, formData, { headers: formData.getHeaders() });
+}
+
+
 async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null, initialVariables = {}, flowData = null) {
     let currentFlowData = flowData;
     let variables = { ...initialVariables };
@@ -233,51 +267,37 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
             case 'image': case 'video': case 'audio': {
-                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
                 const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
-                const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
-                
-                const method = typeMap[currentNode.type];
                 let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
                 
                 if (fileIdentifier) {
                     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
                     
-                    if (isLibraryFile) {
-                        try {
-                            const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
-                            if (storageBotToken) {
-                                const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
-                                if (fileInfo.ok) {
-                                    fileIdentifier = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.result.file_path}`;
-                                } else {
-                                    throw new Error('Não foi possível obter o caminho do arquivo do Telegram.');
+                    try {
+                        let response;
+                        if (isLibraryFile) {
+                            if (currentNode.type === 'audio') {
+                                const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
+                                if (duration > 0) {
+                                    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
+                                    await new Promise(resolve => setTimeout(resolve, duration * 1000));
                                 }
-                            } else {
-                                throw new Error('Token do bot de armazenamento não configurado.');
                             }
-                        } catch (e) {
-                            console.error("Falha ao obter URL do arquivo da biblioteca", e.message);
-                            // Se falhar, pula para o próximo nó para não travar o fluxo
-                            currentNodeId = findNextNode(currentNodeId, 'a', edges);
-                            continue; // Pula a execução do envio
+                            response = await sendMediaAsProxy(botToken, chatId, fileIdentifier, currentNode.type, caption);
+                        } else {
+                            // Lógica para URL externa
+                            const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+                            const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+                            const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier, caption };
+                            response = await sendTelegramRequest(botToken, methodMap[currentNode.type], payload);
                         }
-                    }
 
-                    if (currentNode.type === 'audio') {
-                        const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
-                        if (duration > 0) {
-                            await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
-                            await new Promise(resolve => setTimeout(resolve, duration * 1000));
+                        if (response && response.ok) {
+                            await saveMessageToDb(sellerId, botId, response.result, 'bot');
                         }
-                    }
-
-                    const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier, caption };
-                    const response = await sendTelegramRequest(botToken, method, payload);
-
-                    if (response && response.ok) {
-                        await saveMessageToDb(sellerId, botId, response.result, 'bot');
+                    } catch(e) {
+                         console.error(`Erro ao enviar mídia no fluxo: ${e.message}`);
                     }
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
@@ -566,23 +586,7 @@ app.post('/api/chats/:botId/send-library-media', authenticateJwt, async (req, re
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, req.user.id]);
         if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
 
-        const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
-        if (!storageBotToken) throw new Error('Token do bot de armazenamento não configurado.');
-
-        const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileId });
-        if (!fileInfo.ok) throw new Error('Não foi possível obter informações do arquivo da biblioteca.');
-
-        const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.result.file_path}`;
-
-        const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
-        const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
-
-        const method = methodMap[fileType];
-        const field = fieldMap[fileType];
-
-        if (!method) return res.status(400).json({ message: 'Tipo de arquivo não suportado.' });
-        
-        const response = await sendTelegramRequest(bot.bot_token, method, { chat_id: chatId, [field]: fileUrl });
+        const response = await sendMediaAsProxy(bot.bot_token, chatId, fileId, fileType, null);
 
         if (response.ok) {
             await saveMessageToDb(req.user.id, botId, response.result, 'operator');
@@ -594,6 +598,7 @@ app.post('/api/chats/:botId/send-library-media', authenticateJwt, async (req, re
         res.status(500).json({ message: 'Não foi possível enviar a mídia: ' + error.message });
     }
 });
+
 
 app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
     const { chatId, fileData, fileType, fileName } = req.body;
