@@ -267,7 +267,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                         parse_mode: 'HTML',
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: '📋 Copiar Código PIX', switch_inline_query_current_chat: response.data.qr_code_text }]
+                                [{ text: '📋 Copiar Código PIX', copy_text: response.data.qr_code_text }]
                             ]
                         }
                     });
@@ -542,7 +542,7 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
             parse_mode: 'HTML',
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: buttonText, switch_inline_query_current_chat: qr_code_text }]
+                    [{ text: buttonText, copy_text: qr_code_text }]
                 ]
             }
         });
