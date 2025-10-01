@@ -78,10 +78,24 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     let mediaType = null;
     let mediaFileId = null;
     let messageText = text;
-    let clickId = null;
+    let newClickId = null;
 
+    // Verifica se há um novo click_id a partir de um comando /start
     if (text && text.startsWith('/start ')) {
-        clickId = text.substring(7);
+        newClickId = text.substring(7);
+    }
+
+    // Determina o click_id a ser salvo com a mensagem
+    let finalClickId = newClickId;
+    if (!finalClickId) {
+        // Se não houver um novo click_id, busca o existente para a conversa
+        const result = await sqlWithRetry(
+            'SELECT click_id FROM telegram_chats WHERE chat_id = $1 AND bot_id = $2 AND click_id IS NOT NULL ORDER BY created_at DESC LIMIT 1',
+            [chat.id, botId]
+        );
+        if (result.length > 0) {
+            finalClickId = result[0].click_id;
+        }
     }
 
     if (photo) {
@@ -100,16 +114,18 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
 
+    // Insere a nova mensagem com o click_id determinado
     await sqlWithRetry(`
-        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id, click_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (chat_id, message_id) DO NOTHING;
-    `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId]);
+    `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, finalClickId]);
 
-    if (clickId) {
+    // Se houver um novo click_id, atualiza todas as mensagens anteriores desta conversa para garantir consistência
+    if (newClickId) {
         await sqlWithRetry(
             'UPDATE telegram_chats SET click_id = $1 WHERE chat_id = $2 AND bot_id = $3',
-            [clickId, chat.id, botId]
+            [newClickId, chat.id, botId]
         );
     }
 }
@@ -542,9 +558,6 @@ app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
         
         const [flow] = await sqlWithRetry('SELECT nodes FROM flows WHERE id = $1 AND bot_id = $2', [flowId, botId]);
         if (!flow) return res.status(404).json({ message: 'Fluxo não encontrado' });
-        
-        // LINHA PROBLEMÁTICA REMOVIDA
-        // await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
         
         const flowData = flow.nodes;
         const startNode = flowData.nodes.find(node => node.type === 'trigger');
