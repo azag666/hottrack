@@ -200,8 +200,22 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         
         switch (currentNode.type) {
             case 'message': {
+                if (nodeData.addTypingAction && nodeData.typingDuration > 0) {
+                    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+                    await new Promise(resolve => setTimeout(resolve, nodeData.typingDuration * 1000));
+                }
+
                 const textToSend = await replaceVariables(nodeData.text, variables);
-                const response = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+                
+                let payload = { chat_id: chatId, text: textToSend, parse_mode: 'HTML' };
+                if (nodeData.buttonText && nodeData.buttonUrl) {
+                    payload.reply_markup = {
+                        inline_keyboard: [[{ text: nodeData.buttonText, url: nodeData.buttonUrl }]]
+                    };
+                }
+
+                const response = await sendTelegramRequest(botToken, 'sendMessage', payload);
+                
                 if (response.ok) {
                     await saveMessageToDb(sellerId, botId, response.result, 'bot');
                 }
@@ -295,6 +309,22 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const errorMessage = error.response?.data?.message || error.message || "Erro ao gerar PIX.";
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
                     if (sentMessage.ok) await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
+                }
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                break;
+            }
+             case 'forward_flow': {
+                const targetFlowId = nodeData.targetFlowId;
+                if (targetFlowId) {
+                    const [newFlow] = await sqlWithRetry('SELECT nodes FROM flows WHERE id = $1 AND seller_id = $2', [targetFlowId, sellerId]);
+                    if (newFlow && newFlow.nodes) {
+                        currentFlowData = newFlow.nodes;
+                        nodes = currentFlowData.nodes || [];
+                        edges = currentFlowData.edges || [];
+                        const startNode = nodes.find(node => node.type === 'trigger');
+                        currentNodeId = findNextNode(startNode.id, null, edges);
+                        continue; 
+                    }
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
