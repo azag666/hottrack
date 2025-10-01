@@ -801,6 +801,102 @@ app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro ao excluir a mídia.' });
     }
 });
+
+// --- NOVAS ROTAS PARA COMPARTILHAMENTO DE FLUXOS ---
+
+app.post('/api/flows/:id/share', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    const { name, description } = req.body;
+    const sellerId = req.user.id;
+    try {
+        const [flow] = await sqlWithRetry('SELECT * FROM flows WHERE id = $1 AND seller_id = $2', [id, sellerId]);
+        if (!flow) return res.status(404).json({ message: 'Fluxo não encontrado.' });
+
+        const [seller] = await sqlWithRetry('SELECT name FROM sellers WHERE id = $1', [sellerId]);
+        if (!seller) return res.status(404).json({ message: 'Vendedor não encontrado.' });
+        
+        await sqlWithRetry(`
+            INSERT INTO shared_flows (name, description, original_flow_id, seller_id, seller_name, nodes)
+            VALUES ($1, $2, $3, $4, $5, $6)`,
+            [name, description, id, sellerId, seller.name, flow.nodes]
+        );
+        await sqlWithRetry('UPDATE flows SET is_shared = TRUE WHERE id = $1', [id]);
+        res.status(201).json({ message: 'Fluxo compartilhado com sucesso!' });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao compartilhar fluxo: ' + error.message });
+    }
+});
+
+app.get('/api/shared-flows', authenticateJwt, async (req, res) => {
+    try {
+        const sharedFlows = await sqlWithRetry('SELECT id, name, description, seller_name, import_count, created_at FROM shared_flows ORDER BY import_count DESC, created_at DESC');
+        res.status(200).json(sharedFlows);
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao buscar fluxos da comunidade.' });
+    }
+});
+
+app.post('/api/shared-flows/:id/import', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    const { botId } = req.body;
+    const sellerId = req.user.id;
+    try {
+        if (!botId) return res.status(400).json({ message: 'É necessário selecionar um bot para importar.' });
+        
+        const [sharedFlow] = await sqlWithRetry('SELECT * FROM shared_flows WHERE id = $1', [id]);
+        if (!sharedFlow) return res.status(404).json({ message: 'Fluxo compartilhado não encontrado.' });
+
+        const newFlowName = `${sharedFlow.name} (Importado)`;
+        const [newFlow] = await sqlWithRetry(
+            `INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES ($1, $2, $3, $4) RETURNING *`,
+            [sellerId, botId, newFlowName, sharedFlow.nodes]
+        );
+        
+        await sqlWithRetry('UPDATE shared_flows SET import_count = import_count + 1 WHERE id = $1', [id]);
+        
+        res.status(201).json(newFlow);
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao importar fluxo: ' + error.message });
+    }
+});
+
+app.post('/api/flows/:id/generate-share-link', authenticateJwt, async (req, res) => {
+    const { id } = req.params;
+    const sellerId = req.user.id;
+    try {
+        const shareId = uuidv4();
+        const [updatedFlow] = await sqlWithRetry(
+            `UPDATE flows SET shareable_link_id = $1 WHERE id = $2 AND seller_id = $3 RETURNING shareable_link_id`,
+            [shareId, id, sellerId]
+        );
+        if (!updatedFlow) return res.status(404).json({ message: 'Fluxo não encontrado.' });
+        res.status(200).json({ shareable_link_id: updatedFlow.shareable_link_id });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao gerar link de compartilhamento.' });
+    }
+});
+
+app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
+    const { shareableLinkId, botId } = req.body;
+    const sellerId = req.user.id;
+    try {
+        if (!botId || !shareableLinkId) return res.status(400).json({ message: 'ID do link e ID do bot são obrigatórios.' });
+        
+        const [originalFlow] = await sqlWithRetry('SELECT name, nodes FROM flows WHERE shareable_link_id = $1', [shareableLinkId]);
+        if (!originalFlow) return res.status(404).json({ message: 'Link de compartilhamento inválido ou expirado.' });
+
+        const newFlowName = `${originalFlow.name} (Importado)`;
+        const [newFlow] = await sqlWithRetry(
+            `INSERT INTO flows (seller_id, bot_id, name, nodes) VALUES ($1, $2, $3, $4) RETURNING *`,
+            [sellerId, botId, newFlowName, originalFlow.nodes]
+        );
+        res.status(201).json(newFlow);
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao importar fluxo por link: ' + error.message });
+    }
+});
+
+
 app.post('/api/webhook/telegram/:botId', async (req, res) => {
     const { botId } = req.params;
     const body = req.body;
@@ -1200,23 +1296,19 @@ app.get('/api/cron/process-disparo-queue', async (req, res) => {
                 console.error(`Falha ao processar job ${id} para chat ${chat_id}: ${e.message}`);
             }
 
-            // Apenas adiciona ao log; não atualiza mais o total_sent aqui
             await sqlWithRetry(
                 `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
                 [history_id, chat_id, bot_id, logStatus, lastTransactionId]
             );
 
             if (logStatus !== 'FAILED') {
-                // Atualiza o contador de envios na tabela principal do histórico
                 await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [history_id]);
             }
 
-            // Deleta o job da fila após o processamento
             await sqlWithRetry(`DELETE FROM disparo_queue WHERE id = $1`, [id]);
             processedCount++;
         }
 
-        // Verifica se a fila está vazia para finalizar a campanha
         const runningCampaigns = await sqlWithRetry(`SELECT id FROM disparo_history WHERE status = 'RUNNING'`);
         for(const campaign of runningCampaigns) {
             const remainingInQueue = await sqlWithRetry(`SELECT id FROM disparo_queue WHERE history_id = $1 LIMIT 1`, [campaign.id]);
