@@ -108,7 +108,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         mediaFileId = voice.file_id;
         messageText = '[Mensagem de Voz]';
     }
-    const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Disparo)' } : {};
+    const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Automação)' } : {};
     const fromUser = from || chat;
 
     await sqlWithRetry(`
@@ -458,11 +458,17 @@ app.delete('/api/flows/:id', authenticateJwt, async (req, res) => {
 app.get('/api/chats/:botId', authenticateJwt, async (req, res) => {
     try {
         const users = await sqlWithRetry(`
-            SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
-            WHERE bot_id = $1 AND seller_id = $2
-            ORDER BY chat_id, created_at DESC;`, [req.params.botId, req.user.id]);
+            SELECT * FROM (
+                SELECT DISTINCT ON (chat_id) * FROM telegram_chats 
+                WHERE bot_id = $1 AND seller_id = $2
+                ORDER BY chat_id, created_at DESC
+            ) AS latest_chats
+            ORDER BY created_at DESC;
+        `, [req.params.botId, req.user.id]);
         res.status(200).json(users);
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); }
+    } catch (error) { 
+        res.status(500).json({ message: 'Erro ao buscar usuários do chat.' }); 
+    }
 });
 app.get('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
     try {
@@ -899,17 +905,20 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
             
             await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING' WHERE id = $1`, [historyId]);
             
-            const allContacts = new Set();
+            const allContacts = new Map();
             for (const botId of botIds) {
-                 const contacts = await sqlWithRetry('SELECT DISTINCT chat_id, first_name, last_name, click_id FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2', [botId, sellerId]);
-                 contacts.forEach(c => allContacts.add(JSON.stringify({...c, bot_id: botId})));
+                 const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) * FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2 ORDER BY chat_id, created_at DESC', [botId, sellerId]);
+                 contacts.forEach(c => {
+                     if (!allContacts.has(c.chat_id)) {
+                         allContacts.set(c.chat_id, {...c, bot_id_source: botId});
+                     }
+                 });
             }
-            const uniqueContacts = Array.from(allContacts).map(c => JSON.parse(c));
+            const uniqueContacts = Array.from(allContacts.values());
             totalProcessed = uniqueContacts.length;
 
-
             for (const contact of uniqueContacts) {
-                const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [contact.bot_id]);
+                const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [contact.bot_id_source]);
                 if (!bot || !bot.bot_token) continue;
                 
                 let userVariables = {
@@ -922,7 +931,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
                 for (const step of flowSteps) {
                      try {
-                        await new Promise(resolve => setTimeout(resolve, 500));
+                        await new Promise(resolve => setTimeout(resolve, 300));
                         
                         let response;
 
@@ -957,7 +966,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                         }
 
                         if (response && response.ok) {
-                            await saveMessageToDb(bot.seller_id, contact.bot_id, response.result, 'bot');
+                           await saveMessageToDb(bot.seller_id, contact.bot_id_source, response.result, 'bot');
                         }
 
                      } catch (error) {
@@ -968,7 +977,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                 
                 await sqlWithRetry(
                     `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
-                    [historyId, contact.chat_id, contact.bot_id, logStatus, lastTransactionId]
+                    [historyId, contact.chat_id, contact.bot_id_source, logStatus, lastTransactionId]
                 );
             }
              await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED', total_sent = $2 WHERE id = $1`, [historyId, totalProcessed]);
