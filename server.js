@@ -257,18 +257,21 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const response = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id, value_cents: valueInCents }, { headers: { 'x-api-key': seller.hottrack_api_key } });
                     variables.last_transaction_id = response.data.transaction_id;
                     await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
-                    const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
-                    const textToSend = `${customText}\n\n<code>${response.data.qr_code_text}</code>`;
+                    
+                    const pixMessageText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
+                    const textToSend = `<pre>${response.data.qr_code_text}</pre>\n\n${pixMessageText}`;
+                    
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', {
                         chat_id: chatId,
                         text: textToSend,
                         parse_mode: 'HTML',
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: 'Copiar Código PIX', switch_inline_query_current_chat: response.data.qr_code_text }]
+                                [{ text: '📋 Copiar Código PIX', switch_inline_query_current_chat: response.data.qr_code_text }]
                             ]
                         }
                     });
+
                     if (sentMessage.ok) {
                         await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                     }
@@ -515,7 +518,7 @@ app.delete('/api/chats/:botId/:chatId', authenticateJwt, async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Erro ao deletar a conversa.' }); }
 });
 app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
-    const { botId, chatId, click_id, valueInCents } = req.body;
+    const { botId, chatId, click_id, valueInCents, pixMessage, pixButtonText } = req.body;
     try {
         if (!click_id) return res.status(400).json({ message: "Usuário não tem um Click ID para gerar PIX." });
         
@@ -528,14 +531,18 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
         await sqlWithRetry(`UPDATE telegram_chats SET last_transaction_id = $1 WHERE bot_id = $2 AND chat_id = $3`, [transaction_id, botId, chatId]);
 
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1', [botId]);
-        const textToSend = `✅ PIX Gerado! Copie o código abaixo para pagar:\n\n<code>${qr_code_text}</code>`;
+        
+        const messageText = pixMessage || '✅ PIX Gerado! Copie o código abaixo para pagar:';
+        const buttonText = pixButtonText || '📋 Copiar Código PIX';
+        const textToSend = `<pre>${qr_code_text}</pre>\n\n${messageText}`;
+
         const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
             chat_id: chatId,
             text: textToSend,
             parse_mode: 'HTML',
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: 'Copiar Código PIX', switch_inline_query_current_chat: qr_code_text }]
+                    [{ text: buttonText, switch_inline_query_current_chat: qr_code_text }]
                 ]
             }
         });
