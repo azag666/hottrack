@@ -108,7 +108,7 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
         mediaFileId = voice.file_id;
         messageText = '[Mensagem de Voz]';
     }
-    const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
+    const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Disparo)' } : {};
     const fromUser = from || chat;
 
     await sqlWithRetry(`
@@ -817,7 +817,64 @@ app.post('/api/bots/contacts-count', authenticateJwt, async (req, res) => {
     }
 });
 
+
 // --- NOVAS ROTAS PARA VALIDAÇÃO E DISPAROS ---
+app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
+    const { botId } = req.body;
+    const sellerId = req.user.id;
+
+    if (!botId) {
+        return res.status(400).json({ message: 'ID do bot é obrigatório.' });
+    }
+
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
+        if (!bot || !bot.bot_token) {
+            return res.status(404).json({ message: 'Bot não encontrado ou sem token configurado.' });
+        }
+
+        const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) chat_id, first_name, last_name, username FROM telegram_chats WHERE bot_id = $1', [botId]);
+        if (contacts.length === 0) {
+            return res.status(200).json({ inactive_contacts: [], message: 'Nenhum contato para validar.' });
+        }
+
+        const inactiveContacts = [];
+        for (const contact of contacts) {
+            try {
+                await sendTelegramRequest(bot.bot_token, 'sendChatAction', { chat_id: contact.chat_id, action: 'typing' });
+            } catch (error) {
+                if (error.response && (error.response.status === 403 || error.response.status === 400)) { // 403: Forbidden, 400: Bad Request (chat not found)
+                    inactiveContacts.push(contact);
+                }
+            }
+            await new Promise(resolve => setTimeout(resolve, 200)); 
+        }
+
+        res.status(200).json({ inactive_contacts: inactiveContacts });
+
+    } catch (error) {
+        console.error("Erro ao validar contatos:", error);
+        res.status(500).json({ message: 'Erro interno ao validar contatos.' });
+    }
+});
+
+app.post('/api/bots/remove-contacts', authenticateJwt, async (req, res) => {
+    const { botId, chatIds } = req.body;
+    const sellerId = req.user.id;
+
+    if (!botId || !Array.isArray(chatIds) || chatIds.length === 0) {
+        return res.status(400).json({ message: 'ID do bot e uma lista de chat_ids são obrigatórios.' });
+    }
+
+    try {
+        const result = await sqlWithRetry('DELETE FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2 AND chat_id = ANY($3::bigint[])', [botId, sellerId, chatIds]);
+        res.status(200).json({ message: `${result.count} contatos inativos foram removidos com sucesso.` });
+    } catch (error) {
+        console.error("Erro ao remover contatos:", error);
+        res.status(500).json({ message: 'Erro interno ao remover contatos.' });
+    }
+});
+
 app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
     const sellerId = req.user.id;
     const { botIds, flowSteps, campaignName } = req.body;
@@ -841,74 +898,78 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
             const hottrackApiKey = seller?.hottrack_api_key;
             
             await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING' WHERE id = $1`, [historyId]);
-
+            
+            const allContacts = new Set();
             for (const botId of botIds) {
-                const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
+                 const contacts = await sqlWithRetry('SELECT DISTINCT chat_id, first_name, last_name, click_id FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2', [botId, sellerId]);
+                 contacts.forEach(c => allContacts.add(JSON.stringify({...c, bot_id: botId})));
+            }
+            const uniqueContacts = Array.from(allContacts).map(c => JSON.parse(c));
+            totalProcessed = uniqueContacts.length;
+
+
+            for (const contact of uniqueContacts) {
+                const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [contact.bot_id]);
                 if (!bot || !bot.bot_token) continue;
-
-                const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) chat_id, first_name, last_name, click_id FROM telegram_chats WHERE bot_id = $1', [botId]);
                 
-                for (const contact of contacts) {
-                    totalProcessed++;
-                    let userVariables = {
-                        primeiro_nome: contact.first_name || '',
-                        nome_completo: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
-                        click_id: contact.click_id
-                    };
-                    let lastTransactionId = null;
-                    let logStatus = 'SENT';
+                let userVariables = {
+                    primeiro_nome: contact.first_name || '',
+                    nome_completo: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
+                    click_id: contact.click_id
+                };
+                let lastTransactionId = null;
+                let logStatus = 'SENT';
 
-                    for (const step of flowSteps) {
-                         try {
-                            await new Promise(resolve => setTimeout(resolve, 500));
+                for (const step of flowSteps) {
+                     try {
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        
+                        let response;
+
+                        if (step.type === 'message') {
+                            const textToSend = await replaceVariables(step.text, userVariables);
+                            let payload = { chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML' };
+                            if (step.buttonText && step.buttonUrl) {
+                                payload.reply_markup = { inline_keyboard: [[{ text: step.buttonText, url: step.buttonUrl }]] };
+                            }
+                            response = await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
+
+                        } else if (['image', 'video', 'audio'].includes(step.type)) {
+                            const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
+                            const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
+                            const caption = await replaceVariables(step.caption, userVariables);
+                            let payload = { chat_id: contact.chat_id, [field]: step.fileUrl, caption: caption, parse_mode: 'HTML' };
+                            response = await sendTelegramRequest(bot.bot_token, method, payload);
+
+                        } else if (step.type === 'pix') {
+                            if (!hottrackApiKey || !userVariables.click_id) continue;
+                            const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id: userVariables.click_id, value_cents: step.valueInCents }, { headers: { 'x-api-key': hottrackApiKey } });
+                            lastTransactionId = pixResponse.data.transaction_id;
                             
-                            let response;
+                            const messageText = await replaceVariables(step.pixMessage, userVariables);
+                            const buttonText = await replaceVariables(step.pixButtonText, userVariables);
+                            const textToSend = `${messageText}\n\n<pre>${pixResponse.data.qr_code_text}</pre>`;
 
-                            if (step.type === 'message') {
-                                const textToSend = await replaceVariables(step.text, userVariables);
-                                let payload = { chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML' };
-                                if (step.buttonText && step.buttonUrl) {
-                                    payload.reply_markup = { inline_keyboard: [[{ text: step.buttonText, url: step.buttonUrl }]] };
-                                }
-                                response = await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
+                            response = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
+                                chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML',
+                                reply_markup: { inline_keyboard: [[{ text: buttonText, copy_text: { text: pixResponse.data.qr_code_text }}]]}
+                            });
+                        }
 
-                            } else if (['image', 'video', 'audio'].includes(step.type)) {
-                                const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
-                                const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
-                                const caption = await replaceVariables(step.caption, userVariables);
-                                let payload = { chat_id: contact.chat_id, [field]: step.fileUrl, caption: caption, parse_mode: 'HTML' };
-                                response = await sendTelegramRequest(bot.bot_token, method, payload);
+                        if (response && response.ok) {
+                            await saveMessageToDb(bot.seller_id, contact.bot_id, response.result, 'bot');
+                        }
 
-                            } else if (step.type === 'pix') {
-                                if (!hottrackApiKey || !userVariables.click_id) continue;
-                                const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id: userVariables.click_id, value_cents: step.valueInCents }, { headers: { 'x-api-key': hottrackApiKey } });
-                                lastTransactionId = pixResponse.data.transaction_id;
-                                
-                                const messageText = await replaceVariables(step.pixMessage, userVariables);
-                                const buttonText = await replaceVariables(step.pixButtonText, userVariables);
-                                const textToSend = `${messageText}\n\n<pre>${pixResponse.data.qr_code_text}</pre>`;
-
-                                response = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
-                                    chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML',
-                                    reply_markup: { inline_keyboard: [[{ text: buttonText, copy_text: { text: pixResponse.data.qr_code_text }}]]}
-                                });
-                            }
-
-                            if (response && response.ok) {
-                                await saveMessageToDb(bot.seller_id, botId, response.result, 'bot');
-                            }
-
-                         } catch (error) {
-                             logStatus = 'FAILED';
-                             break; 
-                         }
-                    }
-                    
-                    await sqlWithRetry(
-                        `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
-                        [historyId, contact.chat_id, botId, logStatus, lastTransactionId]
-                    );
+                     } catch (error) {
+                         logStatus = 'FAILED';
+                         break; 
+                     }
                 }
+                
+                await sqlWithRetry(
+                    `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
+                    [historyId, contact.chat_id, contact.bot_id, logStatus, lastTransactionId]
+                );
             }
              await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED', total_sent = $2 WHERE id = $1`, [historyId, totalProcessed]);
         })();
