@@ -1,5 +1,5 @@
 // ==========================================================
-//          HOTBOT API - VERSÃO FINAL E CORRIGIDA
+//          HOTBOT API - VERSÃO FINAL E OTIMIZADA
 // ==========================================================
 const express = require('express');
 const cors = require('cors');
@@ -825,6 +825,8 @@ app.post('/api/bots/contacts-count', authenticateJwt, async (req, res) => {
 
 
 // --- NOVAS ROTAS PARA VALIDAÇÃO E DISPAROS ---
+
+// ===== ROTA DE VALIDAÇÃO OTIMIZADA =====
 app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
     const { botId } = req.body;
     const sellerId = req.user.id;
@@ -845,15 +847,32 @@ app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
         }
 
         const inactiveContacts = [];
-        for (const contact of contacts) {
-            try {
-                await sendTelegramRequest(bot.bot_token, 'sendChatAction', { chat_id: contact.chat_id, action: 'typing' });
-            } catch (error) {
-                if (error.response && (error.response.status === 403 || error.response.status === 400)) { // 403: Forbidden, 400: Bad Request (chat not found)
-                    inactiveContacts.push(contact);
+        const BATCH_SIZE = 30; // Processar em lotes de 30 para respeitar o rate limit
+
+        for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+            const batch = contacts.slice(i, i + BATCH_SIZE);
+            const promises = batch.map(contact => 
+                sendTelegramRequest(bot.bot_token, 'sendChatAction', { chat_id: contact.chat_id, action: 'typing' })
+                    .then(() => ({ status: 'fulfilled', contact }))
+                    .catch(error => ({ status: 'rejected', error, contact }))
+            );
+
+            const results = await Promise.allSettled(promises);
+
+            results.forEach(result => {
+                if (result.status === 'rejected' || (result.value && result.value.status === 'rejected')) {
+                    const error = result.reason || result.value.error;
+                    const contact = result.value.contact;
+                    if (error.response && (error.response.status === 403 || error.response.status === 400)) {
+                        inactiveContacts.push(contact);
+                    }
                 }
+            });
+
+            // Pequena pausa entre os lotes para segurança extra
+            if (i + BATCH_SIZE < contacts.length) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            await new Promise(resolve => setTimeout(resolve, 200)); 
         }
 
         res.status(200).json({ inactive_contacts: inactiveContacts });
@@ -863,6 +882,7 @@ app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
         res.status(500).json({ message: 'Erro interno ao validar contatos.' });
     }
 });
+
 
 app.post('/api/bots/remove-contacts', authenticateJwt, async (req, res) => {
     const { botId, chatIds } = req.body;
@@ -977,9 +997,10 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                     `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
                     [historyId, contact.chat_id, contact.bot_id_source, logStatus, lastTransactionId]
                 );
-
-                // ATUALIZAÇÃO EM TEMPO REAL
-                await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [historyId]);
+                
+                if (logStatus !== 'FAILED') {
+                    await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [historyId]);
+                }
             }
              await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [historyId]);
         })();
