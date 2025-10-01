@@ -251,7 +251,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         if (userState) await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
         return;
     }
+
     let safetyLock = 0;
+    // ==========================================================
+    //          [CORREÇÃO] Flag para controlar a limpeza de estado
+    // ==========================================================
+    let shouldCleanup = true; 
+
     while (currentNodeId && safetyLock < 20) {
         const currentNode = nodes.find(node => node.id === currentNodeId);
         if (!currentNode) break;
@@ -291,6 +297,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     if (noReplyNodeId) {
                         await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                     }
+                    shouldCleanup = false; // [CORREÇÃO] Impede a limpeza do estado
                     currentNodeId = null;
                 } else {
                     currentNodeId = findNextNode(currentNodeId, 'a', edges);
@@ -340,6 +347,7 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 if (nextNodeId) {
                     await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                 }
+                shouldCleanup = false; // [CORREÇÃO] Impede a limpeza do estado
                 currentNodeId = null; 
                 break;
             }
@@ -378,45 +386,30 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
-            // ==========================================================
-            //          [NOVO] NÓ DE VERIFICAÇÃO DE PIX
-            // ==========================================================
             case 'action_check_pix': {
                 let nextNodeId;
                 try {
-                    // Verifica se existe uma ID de transação salva nas variáveis do usuário
                     if (!variables.last_transaction_id) {
                         console.warn(`[Flow Check PIX] Nenhuma 'last_transaction_id' encontrada para o chat ${chatId}`);
-                        // Se não houver ID, segue o caminho de "Pendente" (handle 'b')
                         nextNodeId = findNextNode(currentNodeId, 'b', edges);
                     } else {
-                        // Busca a chave de API do vendedor
                         const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
                         if (!seller || !seller.hottrack_api_key) {
                             throw new Error("A chave de API do HotTrack não está configurada para este vendedor.");
                         }
-
-                        // Faz a requisição para a API para verificar o status do PIX
                         const response = await axios.get(`https://novaapi-one.vercel.app/api/pix/status/${variables.last_transaction_id}`, {
                             headers: { 'x-api-key': seller.hottrack_api_key }
                         });
-
-                        // Se a resposta da API indicar que o status é 'PAID' (pago)
                         if (response.data && response.data.status === 'PAID') {
-                            // Segue o caminho de "Pago" (handle 'a')
                             nextNodeId = findNextNode(currentNodeId, 'a', edges);
                         } else {
-                            // Para qualquer outro status ('pending', etc.), segue o caminho de "Pendente" (handle 'b')
                             nextNodeId = findNextNode(currentNodeId, 'b', edges);
                         }
                     }
                 } catch (error) {
-                    // Em caso de erro na API (ex: PIX não encontrado, erro de autenticação)
                     console.error(`[Flow Check PIX] Erro ao verificar o status do PIX para o chat ${chatId}:`, error.response?.data || error.message);
-                    // Segue o caminho de "Pendente" (handle 'b') como padrão de segurança
                     nextNodeId = findNextNode(currentNodeId, 'b', edges);
                 }
-                // Define o próximo nó do fluxo
                 currentNodeId = nextNodeId;
                 break;
             }
@@ -437,10 +430,19 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 break;
             }
              default:
-                currentNodeId = findNextNode(currentNodeId, 'a', edges); // Avança em nós desconhecidos
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
         }
         safetyLock++;
+    }
+
+    // ==========================================================
+    //          [CORREÇÃO] Limpa o estado apenas se o fluxo realmente terminou
+    // ==========================================================
+    if (shouldCleanup && !currentNodeId) {
+        if (userState) {
+            await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+        }
     }
 }
 
@@ -460,7 +462,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const botResult = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [timeout.bot_id]);
                     const bot = botResult[0];
                     if (bot) {
-                        const initialVars = timeout.variables || {};
+                        const initialVars = JSON.parse(timeout.variables || '{}');
                         const flowData = initialVars.flow_data ? JSON.parse(initialVars.flow_data) : null;
                         if (initialVars.flow_data) delete initialVars.flow_data;
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
@@ -470,6 +472,7 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
         }
         res.status(200).send(`Processados ${pendingTimeouts.length} jobs.`);
     } catch (error) {
+        console.error("Erro no CRON de timeouts:", error);
         res.status(500).send('Erro interno no servidor.');
     }
 });
