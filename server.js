@@ -160,7 +160,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         variables.click_id = initialVariables.click_id;
     }
 
-    // ===== CORREÇÃO PARA GARANTIR O CLICK_ID =====
     if (!variables.click_id) {
         const lastClickResult = await sqlWithRetry(
             'SELECT click_id FROM telegram_chats WHERE chat_id = $1 AND bot_id = $2 AND click_id IS NOT NULL ORDER BY created_at DESC LIMIT 1',
@@ -170,7 +169,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
             variables.click_id = lastClickResult[0].click_id.replace('/start ', '');
         }
     }
-    // ===== FIM DA CORREÇÃO =====
 
     if (!currentNodeId) {
         if (userState && userState.waiting_for_input) {
@@ -215,10 +213,10 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 }
                 break;
             }
-            case 'image': case 'video': case 'audio': {
-                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
-                const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
-                const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+            case 'image': case 'video': {
+                const typeMap = { image: 'sendPhoto', video: 'sendVideo' };
+                const urlMap = { image: 'imageUrl', video: 'videoUrl' };
+                const fieldMap = { image: 'photo', video: 'video' };
                 const method = typeMap[currentNode.type];
                 let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
@@ -253,6 +251,43 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
+            case 'audio': {
+                const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
+                if (duration > 0) {
+                    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
+                    await new Promise(resolve => setTimeout(resolve, duration * 1000));
+                }
+
+                let fileIdentifier = nodeData.audioUrl;
+                const caption = await replaceVariables(nodeData.caption, variables);
+                let response;
+
+                if (fileIdentifier) {
+                     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
+                     if (isLibraryFile) {
+                        try {
+                            const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
+                            if (!storageBotToken) throw new Error('Storage bot token não configurado.');
+                            const fileInfoResponse = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
+                            if (!fileInfoResponse.ok || !fileInfoResponse.result?.file_path) throw new Error('Não foi possível obter informações do arquivo.');
+                            const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfoResponse.result.file_path}`;
+                            const fileBuffer = await axios.get(fileUrl, { responseType: 'arraybuffer' }).then(res => res.data);
+                            const formData = new FormData();
+                            formData.append('chat_id', chatId);
+                            formData.append('voice', fileBuffer, { filename: 'audiofile' });
+                            if (caption) formData.append('caption', caption);
+                            response = await sendTelegramRequest(botToken, 'sendVoice', formData, { headers: formData.getHeaders() });
+                        } catch (e) { console.error("Erro ao processar áudio da biblioteca:", e.message); }
+                    } else {
+                        response = await sendTelegramRequest(botToken, 'sendVoice', { chat_id: chatId, voice: fileIdentifier, caption });
+                    }
+                    if (response && response.ok) {
+                        await saveMessageToDb(sellerId, botId, response.result, 'bot');
+                    }
+                }
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                break;
+            }
             case 'delay': {
                 const delaySeconds = nodeData.delayInSeconds || 1;
                 const nextNodeId = findNextNode(currentNodeId, null, edges);
@@ -260,6 +295,13 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
                 }
                 currentNodeId = null; 
+                break;
+            }
+            case 'typing_action': {
+                const duration = parseInt(nodeData.durationInSeconds, 10) || 1;
+                await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+                await new Promise(resolve => setTimeout(resolve, duration * 1000));
+                currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
             }
             case 'action_pix': {
@@ -305,8 +347,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
-// ... (código anterior da API, a partir daqui tudo igual até a rota de disparo em massa)
-
 app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
@@ -671,7 +711,7 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         } else if (fileType === 'video') {
             telegramMethod = 'sendVideo';
             fieldName = 'video';
-        } else if (fileType === 'audio') { // Mapeia 'audio' para 'sendVoice'
+        } else if (fileType === 'audio') {
             telegramMethod = 'sendVoice';
             fieldName = 'voice';
         } else {
@@ -687,7 +727,7 @@ app.post('/api/media/upload', authenticateJwt, async (req, res) => {
         } else if (fileType === 'video') {
             fileId = result.video.file_id;
             thumbnailFileId = result.video.thumbnail?.file_id || null;
-        } else { // audio/voice
+        } else {
             fileId = result.voice.file_id;
         }
         if (!fileId) throw new Error('Não foi possível obter o file_id do Telegram.');
@@ -720,13 +760,22 @@ app.post('/api/webhook/telegram/:botId', async (req, res) => {
             const message = body.message;
             const chatId = message?.chat?.id;
             if (!chatId) return;
+
+            const fromUser = message.from || message.chat;
+            let initialVars = {
+                primeiro_nome: fromUser.first_name || '',
+                nome_completo: `${fromUser.first_name || ''} ${fromUser.last_name || ''}`.trim()
+            };
+            
             await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
             await saveMessageToDb(bot.seller_id, botId, message, 'user');
+            
             if (message.text) {
-                let initialVars = {};
                 if (message.text.startsWith('/start ')) {
                     initialVars.click_id = message.text.substring(7);
                 }
+                await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
+            } else {
                 await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
             }
         }
