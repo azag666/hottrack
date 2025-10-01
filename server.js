@@ -64,7 +64,7 @@ function findNextNode(currentNodeId, handleId, edges) {
 }
 
 async function sendTelegramRequest(botToken, method, data, options = {}, retries = 3, delay = 1500) {
-    const { headers = {}, responseType = 'json', timeout = 15000 } = options; // Timeout padrão de 15s
+    const { headers = {}, responseType = 'json', timeout = 30000 } = options; // Timeout aumentado para 30s
     const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
 
     for (let i = 0; i < retries; i++) {
