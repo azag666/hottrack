@@ -808,7 +808,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
     try {
         const [history] = await sqlWithRetry(
             `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id`,
-            [sellerId, campaignName, botIds, JSON.stringify(flowSteps)]
+            [sellerId, campaignName, JSON.stringify(botIds), JSON.stringify(flowSteps)]
         );
         const historyId = history.id;
 
