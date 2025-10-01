@@ -186,9 +186,6 @@ async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, c
     const method = methodMap[fileType];
     const field = fieldMap[fileType];
     const fileName = fileNameMap[fileType];
-    // ==========================================================
-    //          [CORREÇÃO] Variável 'type' corrigida para 'fileType'
-    // ==========================================================
     const timeout = fileType === 'video' ? 60000 : 30000;
 
     if (!method) throw new Error('Tipo de arquivo não suportado.');
