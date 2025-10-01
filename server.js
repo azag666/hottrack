@@ -186,7 +186,10 @@ async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, c
     const method = methodMap[fileType];
     const field = fieldMap[fileType];
     const fileName = fileNameMap[fileType];
-    const timeout = type === 'video' ? 60000 : 30000; // Timeout maior para mídias
+    // ==========================================================
+    //          [CORREÇÃO] Variável 'type' corrigida para 'fileType'
+    // ==========================================================
+    const timeout = fileType === 'video' ? 60000 : 30000;
 
     if (!method) throw new Error('Tipo de arquivo não suportado.');
 
@@ -208,7 +211,7 @@ async function handleMediaNode(node, botToken, chatId, caption) {
 
     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
     let response;
-    const timeout = type === 'video' ? 60000 : 30000; // 60s para vídeo, 30s para outros
+    const timeout = type === 'video' ? 60000 : 30000;
 
     if (isLibraryFile) {
         if (type === 'audio') {
@@ -388,9 +391,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     });
                     if (sentMessage.ok) await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                 } catch (error) {
-                    // ==========================================================
-                    //          [CORREÇÃO] Envia erro amigável e loga o técnico
-                    // ==========================================================
                     console.error(`[Flow PIX Error] Erro ao gerar PIX para o chat ${chatId}:`, error.response?.data || error.message);
                     const userErrorMessage = "Ocorreu um erro ao tentar gerar seu PIX. Por favor, tente novamente em instantes.";
                     const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: userErrorMessage });
@@ -1012,17 +1012,12 @@ app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
     }
 });
 
-// ==========================================================
-//          [CORREÇÃO] Webhook com resposta imediata
-// ==========================================================
 app.post('/api/webhook/telegram/:botId', (req, res) => {
-    // Responde imediatamente para o Telegram para evitar retentativas e duplicação
     res.sendStatus(200); 
 
     const { botId } = req.params;
     const body = req.body;
 
-    // Executa o processamento do fluxo em segundo plano
     (async () => {
         try {
             const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
