@@ -15,6 +15,11 @@ const FormData = require('form-data');
 
 const app = express();
 
+// ******** CORREÇÃO APLICADA AQUI ********
+// Informa ao Express para confiar no proxy da Vercel (ou de outra hospedagem).
+// Isso é necessário para que o express-rate-limit funcione corretamente.
+app.set('trust proxy', 1);
+
 // --- CONFIGURAÇÕES DE SEGURANÇA ---
 app.use(helmet()); // Adiciona cabeçalhos de segurança HTTP
 app.use(express.json({ limit: '10mb' }));
@@ -728,7 +733,8 @@ app.put('/api/bots/:id',
 
 // --- Webhook (Rota pública, mas com validação interna) ---
 app.post('/api/webhook/telegram/:botId', 
-    [ param('botId').isUUID() ], // Valida se o botId tem formato de UUID se aplicável, ou isInt() se for inteiro.
+    // Validação básica do parâmetro da rota
+    [ param('botId').isInt({ allow_leading_zeroes: false }) ],
     handleValidationErrors,
     async (req, res) => {
     const { botId } = req.params;
@@ -736,7 +742,10 @@ app.post('/api/webhook/telegram/:botId',
     res.sendStatus(200); // Responde imediatamente ao Telegram
     try {
         const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
-        if (!bot) return;
+        if (!bot) {
+            console.warn(`Webhook recebido para botId desconhecido: ${botId}`);
+            return;
+        };
         
         if (body.message) {
             const message = body.message;
