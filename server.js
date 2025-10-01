@@ -64,7 +64,7 @@ function findNextNode(currentNodeId, handleId, edges) {
 }
 
 async function sendTelegramRequest(botToken, method, data, options = {}, retries = 3, delay = 1500) {
-    const { headers = {}, responseType = 'json' } = options;
+    const { headers = {}, responseType = 'json', timeout = 15000 } = options; // Timeout padrão de 15s
     const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
 
     for (let i = 0; i < retries; i++) {
@@ -74,7 +74,7 @@ async function sendTelegramRequest(botToken, method, data, options = {}, retries
                 responseType,
                 httpAgent,
                 httpsAgent,
-                timeout: 15000 // Aumentado para 15 segundos para mídias
+                timeout
             });
             return response.data;
         } catch (error) {
@@ -89,8 +89,10 @@ async function sendTelegramRequest(botToken, method, data, options = {}, retries
             const errorMessage = (errorData instanceof ArrayBuffer)
                 ? JSON.parse(Buffer.from(errorData).toString('utf8'))
                 : errorData;
+            
+            const chatId = data instanceof FormData ? data.getBoundary && data.get('chat_id') : data.chat_id;
 
-            console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${data.chat_id || (data.get && data.get('chat_id'))}:`, errorMessage || error.message);
+            console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${chatId}:`, errorMessage || error.message);
             throw error;
         }
     }
@@ -184,17 +186,15 @@ async function sendMediaAsProxy(destinationBotToken, chatId, fileId, fileType, c
     const method = methodMap[fileType];
     const field = fieldMap[fileType];
     const fileName = fileNameMap[fileType];
+    const timeout = type === 'video' ? 60000 : 30000; // Timeout maior para mídias
 
     if (!method) throw new Error('Tipo de arquivo não suportado.');
 
     formData.append(field, fileBuffer, { filename: fileName, contentType: fileHeaders['content-type'] });
 
-    return await sendTelegramRequest(destinationBotToken, method, formData, { headers: formData.getHeaders() });
+    return await sendTelegramRequest(destinationBotToken, method, formData, { headers: formData.getHeaders(), timeout });
 }
 
-// ==========================================================
-//          [NOVO] FUNÇÃO CENTRALIZADA PARA NÓS DE MÍDIA
-// ==========================================================
 async function handleMediaNode(node, botToken, chatId, caption) {
     const type = node.type;
     const nodeData = node.data || {};
@@ -208,6 +208,7 @@ async function handleMediaNode(node, botToken, chatId, caption) {
 
     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
     let response;
+    const timeout = type === 'video' ? 60000 : 30000; // 60s para vídeo, 30s para outros
 
     if (isLibraryFile) {
         if (type === 'audio') {
@@ -219,7 +220,6 @@ async function handleMediaNode(node, botToken, chatId, caption) {
         }
         response = await sendMediaAsProxy(botToken, chatId, fileIdentifier, type, caption);
     } else {
-        // Lógica para URL externa
         const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
         const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
         
@@ -227,7 +227,7 @@ async function handleMediaNode(node, botToken, chatId, caption) {
         const field = fieldMap[type];
         
         const payload = { chat_id: chatId, [field]: fileIdentifier, caption };
-        response = await sendTelegramRequest(botToken, method, payload);
+        response = await sendTelegramRequest(botToken, method, payload, { timeout });
     }
     
     return response;
@@ -388,8 +388,12 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     });
                     if (sentMessage.ok) await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                 } catch (error) {
-                    const errorMessage = error.response?.data?.message || error.message || "Erro ao gerar PIX.";
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: errorMessage });
+                    // ==========================================================
+                    //          [CORREÇÃO] Envia erro amigável e loga o técnico
+                    // ==========================================================
+                    console.error(`[Flow PIX Error] Erro ao gerar PIX para o chat ${chatId}:`, error.response?.data || error.message);
+                    const userErrorMessage = "Ocorreu um erro ao tentar gerar seu PIX. Por favor, tente novamente em instantes.";
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: userErrorMessage });
                     if (sentMessage.ok) await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
@@ -655,7 +659,6 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
     } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
 });
 
-// Endpoint para envio de mídia da biblioteca no chat ao vivo
 app.post('/api/chats/:botId/send-library-media', authenticateJwt, async (req, res) => {
     const { chatId, fileId, fileType } = req.body;
     const { botId } = req.params;
@@ -884,8 +887,6 @@ app.delete('/api/media/:id', authenticateJwt, async (req, res) => {
     }
 });
 
-// --- ROTAS DE COMPARTILHAMENTO DE FLUXOS ATUALIZADAS ---
-
 app.post('/api/flows/:id/share', authenticateJwt, async (req, res) => {
     const { id } = req.params;
     const { name, description } = req.body;
@@ -942,7 +943,6 @@ app.post('/api/shared-flows/:id/import', authenticateJwt, async (req, res) => {
     }
 });
 
-// [NOVO] ROTA ATUALIZADA PARA GERAR LINK COM OPÇÕES AVANÇADAS
 app.post('/api/flows/:id/generate-share-link', authenticateJwt, async (req, res) => {
     const { id } = req.params;
     const sellerId = req.user.id;
@@ -968,7 +968,6 @@ app.post('/api/flows/:id/generate-share-link', authenticateJwt, async (req, res)
     }
 });
 
-// [NOVO] ROTA PARA OBTER DETALHES DE UM FLUXO COMPARTILHADO ANTES DE IMPORTAR
 app.get('/api/share/details/:shareId', async (req, res) => {
     try {
         const { shareId } = req.params;
@@ -988,8 +987,6 @@ app.get('/api/share/details/:shareId', async (req, res) => {
     }
 });
 
-
-// [NOVO] ROTA ATUALIZADA PARA IMPORTAR APENAS FLUXOS GRATUITOS
 app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
     const { shareableLinkId, botId } = req.body;
     const sellerId = req.user.id;
@@ -1015,43 +1012,48 @@ app.post('/api/flows/import-from-link', authenticateJwt, async (req, res) => {
     }
 });
 
+// ==========================================================
+//          [CORREÇÃO] Webhook com resposta imediata
+// ==========================================================
+app.post('/api/webhook/telegram/:botId', (req, res) => {
+    // Responde imediatamente para o Telegram para evitar retentativas e duplicação
+    res.sendStatus(200); 
 
-app.post('/api/webhook/telegram/:botId', async (req, res) => {
     const { botId } = req.params;
     const body = req.body;
-    res.sendStatus(200);
-    try {
-        const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
-        if (!bot) return;
-        if (body.message) {
-            const message = body.message;
-            const chatId = message?.chat?.id;
-            if (!chatId) return;
 
-            const fromUser = message.from || message.chat;
-            let initialVars = {
-                primeiro_nome: fromUser.first_name || '',
-                nome_completo: `${fromUser.first_name || ''} ${fromUser.last_name || ''}`.trim()
-            };
-            
-            await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
-            await saveMessageToDb(bot.seller_id, botId, message, 'user');
-            
-            if (message.text) {
-                if (message.text.startsWith('/start ')) {
+    // Executa o processamento do fluxo em segundo plano
+    (async () => {
+        try {
+            const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [botId]);
+            if (!bot) return;
+
+            if (body.message) {
+                const message = body.message;
+                const chatId = message?.chat?.id;
+                if (!chatId) return;
+
+                const fromUser = message.from || message.chat;
+                let initialVars = {
+                    primeiro_nome: fromUser.first_name || '',
+                    nome_completo: `${fromUser.first_name || ''} ${fromUser.last_name || ''}`.trim()
+                };
+                
+                await sqlWithRetry('DELETE FROM flow_timeouts WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+                await saveMessageToDb(bot.seller_id, botId, message, 'user');
+                
+                if (message.text && message.text.startsWith('/start ')) {
                     initialVars.click_id = message.text.substring(7);
                 }
-                await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
-            } else {
+
                 await processFlow(chatId, botId, bot.bot_token, bot.seller_id, null, initialVars, null);
             }
+        } catch (error) {
+            console.error("Erro no processamento em segundo plano do Webhook:", error);
         }
-    } catch (error) {
-        console.error("Erro no Webhook do Telegram:", error);
-    }
+    })();
 });
 
-// --- NOVAS ROTAS PARA IMPORTAÇÃO DE CONTATOS ---
 const NOVA_API_URL = 'https://novaapi-one.vercel.app/api';
 
 app.post('/api/novaapi/connect', authenticateJwt, async (req, res) => {
@@ -1136,7 +1138,6 @@ app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
     }
 });
 
-// --- ROTA PARA CONTAR CONTATOS --
 app.post('/api/bots/contacts-count', authenticateJwt, async (req, res) => {
     const { botIds } = req.body;
     const sellerId = req.user.id;
@@ -1158,7 +1159,6 @@ app.post('/api/bots/contacts-count', authenticateJwt, async (req, res) => {
 });
 
 
-// --- NOVAS ROTAS PARA VALIDAÇÃO E DISPAROS ---
 app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
     const { botId } = req.body;
     const sellerId = req.user.id;
