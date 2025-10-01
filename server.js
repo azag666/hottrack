@@ -1063,7 +1063,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
                     for (const step of flowSteps) {
                         try {
-                            await new Promise(resolve => setTimeout(resolve, 50));
+                            await new Promise(resolve => setTimeout(resolve, 100)); // Pequeno delay entre steps
                             let response;
 
                             if (step.type === 'message') {
@@ -1074,11 +1074,18 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                                 }
                                 response = await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
                             } else if (['image', 'video', 'audio'].includes(step.type)) {
-                                const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
-                                const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
+                                const fileIdentifier = step.fileUrl;
                                 const caption = await replaceVariables(step.caption, userVariables);
-                                let payload = { chat_id: contact.chat_id, [field]: step.fileUrl, caption: caption, parse_mode: 'HTML' };
-                                response = await sendTelegramRequest(bot.bot_token, method, payload);
+                                const isLibraryFile = fileIdentifier && (fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC'));
+
+                                if (isLibraryFile) {
+                                    response = await sendMediaAsProxy(bot.bot_token, contact.chat_id, fileIdentifier, step.type, caption);
+                                } else {
+                                    const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
+                                    const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
+                                    const payload = { chat_id: contact.chat_id, [field]: fileIdentifier, caption: caption, parse_mode: 'HTML' };
+                                    response = await sendTelegramRequest(bot.bot_token, method, payload);
+                                }
                             } else if (step.type === 'pix') {
                                 if (!hottrackApiKey || !userVariables.click_id) continue;
                                 const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id: userVariables.click_id, value_cents: step.valueInCents }, { headers: { 'x-api-key': hottrackApiKey } });
@@ -1099,6 +1106,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                             }
                         } catch (error) {
                             logStatus = 'FAILED';
+                            console.error(`Falha no disparo para ${contact.chat_id}: ${error.message}`);
                             break;
                         }
                     }
