@@ -328,15 +328,23 @@ app.get('/api/health', async (req, res) => {
 });
 app.post('/api/sellers/register', async (req, res) => {
     const { name, email, password } = req.body;
-    if (!name || !email || !password || password.length < 8) return res.status(400).json({ message: 'Dados inválidos.' });
+    if (!name || !email || !password || password.length < 8) {
+        return res.status(400).json({ message: 'Dados inválidos. Nome, email e senha (mínimo 8 caracteres) são obrigatórios.' });
+    }
     try {
         const normalizedEmail = email.trim().toLowerCase();
         const existingSeller = await sqlWithRetry('SELECT id FROM sellers WHERE LOWER(email) = $1', [normalizedEmail]);
-        if (existingSeller.length > 0) return res.status(409).json({ message: 'Este email já está em uso.' });
+        if (existingSeller.length > 0) {
+            return res.status(409).json({ message: 'Este email já está em uso.' });
+        }
         const hashedPassword = await bcrypt.hash(password, 10);
-        await sqlWithRetry('INSERT INTO sellers (name, email, password_hash, is_active) VALUES ($1, $2, $3, TRUE)', [name, normalizedEmail, hashedPassword]);
+        const apiKey = uuidv4();
+        await sqlWithRetry('INSERT INTO sellers (name, email, password_hash, api_key, is_active) VALUES ($1, $2, $3, $4, TRUE)', [name, normalizedEmail, hashedPassword, apiKey]);
         res.status(201).json({ message: 'Vendedor cadastrado com sucesso!' });
-    } catch (error) { res.status(500).json({ message: 'Erro interno do servidor.' }); }
+    } catch (error) {
+        console.error("Erro no registro:", error);
+        res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
 });
 app.post('/api/sellers/login', async (req, res) => {
     const { email, password } = req.body;
