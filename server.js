@@ -543,7 +543,8 @@ app.post('/api/chats/start-flow', authenticateJwt, async (req, res) => {
         const [flow] = await sqlWithRetry('SELECT nodes FROM flows WHERE id = $1 AND bot_id = $2', [flowId, botId]);
         if (!flow) return res.status(404).json({ message: 'Fluxo não encontrado' });
         
-        await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
+        // LINHA PROBLEMÁTICA REMOVIDA
+        // await sqlWithRetry('DELETE FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
         
         const flowData = flow.nodes;
         const startNode = flowData.nodes.find(node => node.type === 'trigger');
