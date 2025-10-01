@@ -15,7 +15,15 @@
   "crons": [
     {
       "path": "/api/health",
-      "schedule": "*/4 * * * *"
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/process-timeouts",
+      "schedule": "*/2 * * * *"
+    },
+    {
+      "path": "/api/cron/process-disparo-queue",
+      "schedule": "* * * * *"
     }
   ]
 }
