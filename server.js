@@ -765,12 +765,10 @@ app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
 
         let importedCount = 0;
         for (const contact of sourceContacts) {
-            // 1. Verifica se o contato já existe
-            const existingContact = await sqlWithRetry(`
+             const existingContact = await sqlWithRetry(`
                 SELECT id FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 LIMIT 1
             `, [destinationBotId, contact.chat_id]);
-
-            // 2. Se não existir, insere
+            
             if (existingContact.length === 0) {
                 const result = await sqlWithRetry(`
                     INSERT INTO telegram_chats 
@@ -797,5 +795,109 @@ app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
         res.status(status).json({ message });
     }
 });
+
+// --- NOVAS ROTAS PARA VALIDAÇÃO E DISPAROS ---
+
+app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
+    const { botId } = req.body;
+    const sellerId = req.user.id;
+
+    if (!botId) {
+        return res.status(400).json({ message: 'ID do bot é obrigatório.' });
+    }
+
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
+        if (!bot || !bot.bot_token) {
+            return res.status(404).json({ message: 'Bot não encontrado ou sem token configurado.' });
+        }
+
+        const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) chat_id, first_name, last_name, username FROM telegram_chats WHERE bot_id = $1', [botId]);
+        if (contacts.length === 0) {
+            return res.status(200).json({ inactive_contacts: [], message: 'Nenhum contato para validar.' });
+        }
+
+        const inactiveContacts = [];
+        for (const contact of contacts) {
+            try {
+                await sendTelegramRequest(bot.bot_token, 'sendChatAction', { chat_id: contact.chat_id, action: 'typing' });
+            } catch (error) {
+                if (error.response && error.response.status === 403) {
+                    inactiveContacts.push(contact);
+                }
+            }
+            await new Promise(resolve => setTimeout(resolve, 200)); // Pequeno delay para evitar rate limiting
+        }
+
+        res.status(200).json({ inactive_contacts: inactiveContacts });
+
+    } catch (error) {
+        console.error("Erro ao validar contatos:", error);
+        res.status(500).json({ message: 'Erro interno ao validar contatos.' });
+    }
+});
+
+app.post('/api/bots/remove-contacts', authenticateJwt, async (req, res) => {
+    const { botId, chatIds } = req.body;
+    const sellerId = req.user.id;
+
+    if (!botId || !Array.isArray(chatIds) || chatIds.length === 0) {
+        return res.status(400).json({ message: 'ID do bot e uma lista de chat_ids são obrigatórios.' });
+    }
+
+    try {
+        const result = await sqlWithRetry('DELETE FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2 AND chat_id = ANY($3)', [botId, sellerId, chatIds]);
+        res.status(200).json({ message: `${result.count} contatos inativos foram removidos com sucesso.` });
+    } catch (error) {
+        console.error("Erro ao remover contatos:", error);
+        res.status(500).json({ message: 'Erro interno ao remover contatos.' });
+    }
+});
+
+app.post('/api/bots/single-send', authenticateJwt, async (req, res) => {
+    const sellerId = req.user.id;
+    const { botId, chatIds, initialText, ctaButtonText, externalLink, imageUrl } = req.body;
+
+    if (!botId || !chatIds || chatIds.length === 0 || !initialText) {
+        return res.status(400).json({ message: 'Bot, contatos e texto da mensagem são obrigatórios.' });
+    }
+
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
+        if (!bot || !bot.bot_token) return res.status(404).json({ message: 'Bot não encontrado ou sem token.' });
+
+        res.status(202).json({ message: `Disparo agendado para ${chatIds.length} usuário(s).` });
+
+        (async () => {
+            let successCount = 0, failureCount = 0;
+            for (const chatId of chatIds) {
+                const endpoint = imageUrl ? 'sendPhoto' : 'sendMessage';
+                const apiUrl = `https://api.telegram.org/bot${bot.bot_token}/${endpoint}`;
+                
+                let payload = { chat_id: chatId, caption: initialText, text: initialText, photo: imageUrl, parse_mode: 'HTML' };
+                if (ctaButtonText && externalLink) {
+                    payload.reply_markup = { inline_keyboard: [[{ text: ctaButtonText, url: externalLink }]] };
+                }
+
+                if (!imageUrl) { delete payload.photo; delete payload.caption; } else { delete payload.text; }
+
+                try {
+                    await axios.post(apiUrl, payload, { timeout: 10000 });
+                    successCount++;
+                } catch (error) {
+                    failureCount++;
+                    console.error(`Falha ao enviar para ${chatId}: ${error.response?.data?.description || error.message}`);
+                }
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+            console.log(`Disparo individual concluído. Sucessos: ${successCount}, Falhas: ${failureCount}`);
+        })();
+
+    } catch (error) {
+        console.error("Erro no disparo individual:", error);
+        if (!res.headersSent) res.status(500).json({ message: 'Erro ao iniciar o disparo.' });
+    }
+});
+
 
 module.exports = app;
