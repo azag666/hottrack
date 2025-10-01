@@ -1020,115 +1020,39 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
     try {
         const [history] = await sqlWithRetry(
-            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status, total_sent) VALUES ($1, $2, $3, $4, 'PENDING', 0) RETURNING id`,
-            [sellerId, campaignName, JSON.stringify(flowSteps), JSON.stringify(flowSteps)]
+            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id`,
+            [sellerId, campaignName, JSON.stringify(botIds), JSON.stringify(flowSteps)]
         );
         const historyId = history.id;
 
+        const allContacts = new Map();
+        for (const botId of botIds) {
+             const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) * FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2 ORDER BY chat_id, created_at DESC', [botId, sellerId]);
+             contacts.forEach(c => {
+                 if (!allContacts.has(c.chat_id)) {
+                     allContacts.set(c.chat_id, {...c, bot_id_source: botId});
+                 }
+             });
+        }
+        const uniqueContacts = Array.from(allContacts.values());
+
+        for (const contact of uniqueContacts) {
+            const userVariables = {
+                primeiro_nome: contact.first_name || '',
+                nome_completo: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
+                click_id: contact.click_id
+            };
+            for (const step of flowSteps) {
+                await sqlWithRetry(
+                    `INSERT INTO disparo_queue (history_id, chat_id, bot_id, step_json, variables_json) VALUES ($1, $2, $3, $4, $5)`,
+                    [historyId, contact.chat_id, contact.bot_id_source, JSON.stringify(step), JSON.stringify(userVariables)]
+                );
+            }
+        }
+        
+        await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING', total_sent = 0 WHERE id = $1`, [historyId]);
+
         res.status(202).json({ message: `Disparo "${campaignName}" agendado com sucesso! O processo ocorrerá em segundo plano.` });
-
-        (async () => {
-            const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
-            const hottrackApiKey = seller?.hottrack_api_key;
-            
-            await sqlWithRetry(`UPDATE disparo_history SET status = 'RUNNING' WHERE id = $1`, [historyId]);
-            
-            const allContacts = new Map();
-            for (const botId of botIds) {
-                 const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) * FROM telegram_chats WHERE bot_id = $1 AND seller_id = $2 ORDER BY chat_id, created_at DESC', [botId, sellerId]);
-                 contacts.forEach(c => {
-                     if (!allContacts.has(c.chat_id)) {
-                         allContacts.set(c.chat_id, {...c, bot_id_source: botId});
-                     }
-                 });
-            }
-            const uniqueContacts = Array.from(allContacts.values());
-
-            const BATCH_SIZE = 25;
-
-            for (let i = 0; i < uniqueContacts.length; i += BATCH_SIZE) {
-                const batch = uniqueContacts.slice(i, i + BATCH_SIZE);
-                
-                const promises = batch.map(contact => (async () => {
-                    const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [contact.bot_id_source]);
-                    if (!bot || !bot.bot_token) return;
-
-                    let userVariables = {
-                        primeiro_nome: contact.first_name || '',
-                        nome_completo: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
-                        click_id: contact.click_id
-                    };
-                    let lastTransactionId = null;
-                    let logStatus = 'SENT';
-
-                    for (const step of flowSteps) {
-                        try {
-                            await new Promise(resolve => setTimeout(resolve, 100)); // Pequeno delay entre steps
-                            let response;
-
-                            if (step.type === 'message') {
-                                const textToSend = await replaceVariables(step.text, userVariables);
-                                let payload = { chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML' };
-                                if (step.buttonText && step.buttonUrl) {
-                                    payload.reply_markup = { inline_keyboard: [[{ text: step.buttonText, url: step.buttonUrl }]] };
-                                }
-                                response = await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
-                            } else if (['image', 'video', 'audio'].includes(step.type)) {
-                                const fileIdentifier = step.fileUrl;
-                                const caption = await replaceVariables(step.caption, userVariables);
-                                const isLibraryFile = fileIdentifier && (fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC'));
-
-                                if (isLibraryFile) {
-                                    response = await sendMediaAsProxy(bot.bot_token, contact.chat_id, fileIdentifier, step.type, caption);
-                                } else {
-                                    const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
-                                    const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
-                                    const payload = { chat_id: contact.chat_id, [field]: fileIdentifier, caption: caption, parse_mode: 'HTML' };
-                                    response = await sendTelegramRequest(bot.bot_token, method, payload);
-                                }
-                            } else if (step.type === 'pix') {
-                                if (!hottrackApiKey || !userVariables.click_id) continue;
-                                const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id: userVariables.click_id, value_cents: step.valueInCents }, { headers: { 'x-api-key': hottrackApiKey } });
-                                lastTransactionId = pixResponse.data.transaction_id;
-                                
-                                const messageText = await replaceVariables(step.pixMessage, userVariables);
-                                const buttonText = await replaceVariables(step.pixButtonText, userVariables);
-                                const textToSend = `${messageText}\n\n<pre>${pixResponse.data.qr_code_text}</pre>`;
-
-                                response = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
-                                    chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML',
-                                    reply_markup: { inline_keyboard: [[{ text: buttonText, copy_text: { text: pixResponse.data.qr_code_text }}]]}
-                                });
-                            }
-
-                            if (response && response.ok) {
-                               await saveMessageToDb(bot.seller_id, contact.bot_id_source, response.result, 'bot');
-                            }
-                        } catch (error) {
-                            logStatus = 'FAILED';
-                            console.error(`Falha no disparo para ${contact.chat_id}: ${error.message}`);
-                            break;
-                        }
-                    }
-
-                    await sqlWithRetry(
-                        `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
-                        [historyId, contact.chat_id, contact.bot_id_source, logStatus, lastTransactionId]
-                    );
-
-                    if (logStatus !== 'FAILED') {
-                        await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [historyId]);
-                    }
-                })());
-
-                await Promise.all(promises);
-
-                if (i + BATCH_SIZE < uniqueContacts.length) {
-                    await new Promise(resolve => setTimeout(resolve, 1100));
-                }
-            }
-             await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [historyId]);
-        })();
 
     } catch (error) {
         console.error("Erro crítico no agendamento do disparo:", error);
@@ -1137,6 +1061,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
         }
     }
 });
+
 
 app.get('/api/disparos/history', authenticateJwt, async (req, res) => {
     try {
@@ -1189,6 +1114,123 @@ app.post('/api/disparos/check-conversions/:historyId', authenticateJwt, async (r
         res.status(200).json({ message: `Verificação concluída. ${updatedCount} novas conversões encontradas.` });
     } catch (error) {
         res.status(500).json({ message: 'Erro ao verificar conversões.' });
+    }
+});
+
+app.get('/api/cron/process-disparo-queue', async (req, res) => {
+    const cronSecret = process.env.CRON_SECRET;
+    if (req.headers['authorization'] !== `Bearer ${cronSecret}`) {
+        return res.status(401).send('Unauthorized');
+    }
+
+    const BATCH_SIZE = 25; // Processa até 25 mensagens por execução do cron
+    let processedCount = 0;
+
+    try {
+        const jobs = await sqlWithRetry(
+            `SELECT * FROM disparo_queue ORDER BY created_at ASC LIMIT $1`,
+            [BATCH_SIZE]
+        );
+
+        if (jobs.length === 0) {
+            return res.status(200).send('Fila de disparos vazia.');
+        }
+
+        for (const job of jobs) {
+            const { id, history_id, chat_id, bot_id, step_json, variables_json } = job;
+            const step = JSON.parse(step_json);
+            const userVariables = JSON.parse(variables_json);
+            
+            let logStatus = 'SENT';
+            let lastTransactionId = null;
+
+            try {
+                const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [bot_id]);
+                if (!bot || !bot.bot_token) {
+                    throw new Error(`Bot com ID ${bot_id} não encontrado ou sem token.`);
+                }
+                
+                const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [bot.seller_id]);
+                const hottrackApiKey = seller?.hottrack_api_key;
+                
+                let response;
+
+                if (step.type === 'message') {
+                    const textToSend = await replaceVariables(step.text, userVariables);
+                    let payload = { chat_id: chat_id, text: textToSend, parse_mode: 'HTML' };
+                    if (step.buttonText && step.buttonUrl) {
+                        payload.reply_markup = { inline_keyboard: [[{ text: step.buttonText, url: step.buttonUrl }]] };
+                    }
+                    response = await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
+                } else if (['image', 'video', 'audio'].includes(step.type)) {
+                    const fileIdentifier = step.fileUrl;
+                    const caption = await replaceVariables(step.caption, userVariables);
+                    const isLibraryFile = fileIdentifier && (fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC'));
+
+                    if (isLibraryFile) {
+                        response = await sendMediaAsProxy(bot.bot_token, chat_id, fileIdentifier, step.type, caption);
+                    } else {
+                        const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
+                        const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
+                        const payload = { chat_id: chat_id, [field]: fileIdentifier, caption: caption, parse_mode: 'HTML' };
+                        response = await sendTelegramRequest(bot.bot_token, method, payload);
+                    }
+                } else if (step.type === 'pix') {
+                    if (!hottrackApiKey || !userVariables.click_id) continue;
+                    const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', { click_id: userVariables.click_id, value_cents: step.valueInCents }, { headers: { 'x-api-key': hottrackApiKey } });
+                    lastTransactionId = pixResponse.data.transaction_id;
+                    
+                    const messageText = await replaceVariables(step.pixMessage, userVariables);
+                    const buttonText = await replaceVariables(step.pixButtonText, userVariables);
+                    const textToSend = `${messageText}\n\n<pre>${pixResponse.data.qr_code_text}</pre>`;
+
+                    response = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
+                        chat_id: chat_id, text: textToSend, parse_mode: 'HTML',
+                        reply_markup: { inline_keyboard: [[{ text: buttonText, copy_text: { text: pixResponse.data.qr_code_text }}]]}
+                    });
+                }
+                
+                if (response && response.ok) {
+                   await saveMessageToDb(bot.seller_id, bot_id, response.result, 'bot');
+                } else if(response && !response.ok) {
+                    throw new Error(response.description);
+                }
+            } catch(e) {
+                logStatus = 'FAILED';
+                console.error(`Falha ao processar job ${id} para chat ${chat_id}: ${e.message}`);
+            }
+
+            await sqlWithRetry(
+                `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
+                [history_id, chat_id, bot_id, logStatus, lastTransactionId]
+            );
+
+            if (logStatus !== 'FAILED') {
+                await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [history_id]);
+            }
+
+            // Deleta o job da fila após o processamento (bem-sucedido ou falho)
+            await sqlWithRetry(`DELETE FROM disparo_queue WHERE id = $1`, [id]);
+            processedCount++;
+        }
+
+        // Verifica se a fila está vazia para finalizar a campanha
+        const remainingJobs = await sqlWithRetry(`SELECT id FROM disparo_queue LIMIT 1`);
+        if(remainingJobs.length === 0) {
+            const runningCampaigns = await sqlWithRetry(`SELECT id FROM disparo_history WHERE status = 'RUNNING'`);
+            for(const campaign of runningCampaigns) {
+                const remainingInQueue = await sqlWithRetry(`SELECT id FROM disparo_queue WHERE history_id = $1 LIMIT 1`, [campaign.id]);
+                if(remainingInQueue.length === 0) {
+                    await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [campaign.id]);
+                }
+            }
+        }
+        
+        res.status(200).send(`Processados ${processedCount} jobs da fila de disparos.`);
+
+    } catch(e) {
+        console.error("Erro crítico no processamento da fila de disparos:", e);
+        res.status(500).send("Erro interno ao processar a fila.");
     }
 });
 
