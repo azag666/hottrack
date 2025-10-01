@@ -146,16 +146,32 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         }
         if (!currentFlowData) return;
     } catch (e) { return; }
+
     let { nodes = [], edges = [] } = currentFlowData;
     let currentNodeId = startNodeId;
+    
     const userStateResult = await sqlWithRetry('SELECT * FROM user_flow_states WHERE chat_id = $1 AND bot_id = $2', [chatId, botId]);
     const userState = userStateResult[0];
+    
     if (userState) {
         variables = { ...userState.variables, ...variables };
     }
     if (initialVariables.click_id) {
         variables.click_id = initialVariables.click_id;
     }
+
+    // ===== CORREÇÃO PARA GARANTIR O CLICK_ID =====
+    if (!variables.click_id) {
+        const lastClickResult = await sqlWithRetry(
+            'SELECT click_id FROM telegram_chats WHERE chat_id = $1 AND bot_id = $2 AND click_id IS NOT NULL ORDER BY created_at DESC LIMIT 1',
+            [chatId, botId]
+        );
+        if (lastClickResult.length > 0) {
+            variables.click_id = lastClickResult[0].click_id.replace('/start ', '');
+        }
+    }
+    // ===== FIM DA CORREÇÃO =====
+
     if (!currentNodeId) {
         if (userState && userState.waiting_for_input) {
             currentNodeId = findNextNode(userState.current_node_id, 'a', edges);
@@ -289,6 +305,8 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
         safetyLock++;
     }
 }
+// ... (código anterior da API, a partir daqui tudo igual até a rota de disparo em massa)
+
 app.get('/api/cron/process-timeouts', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
     if (req.headers['authorization'] !== `Bearer ${cronSecret}`) return res.status(401).send('Unauthorized');
@@ -845,7 +863,7 @@ app.post('/api/bots/validate-contacts', authenticateJwt, async (req, res) => {
         }
 
         const inactiveContacts = [];
-        const BATCH_SIZE = 30; // Processar em lotes de 30 para respeitar o rate limit
+        const BATCH_SIZE = 30; 
 
         for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
             const batch = contacts.slice(i, i + BATCH_SIZE);
@@ -891,7 +909,6 @@ app.post('/api/bots/remove-contacts', authenticateJwt, async (req, res) => {
     }
 });
 
-// ===== ROTA DE DISPARO EM MASSA OTIMIZADA =====
 app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
     const sellerId = req.user.id;
     const { botIds, flowSteps, campaignName } = req.body;
@@ -926,7 +943,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
             }
             const uniqueContacts = Array.from(allContacts.values());
 
-            const BATCH_SIZE = 25; // Enviar para 25 usuários em paralelo
+            const BATCH_SIZE = 25;
 
             for (let i = 0; i < uniqueContacts.length; i += BATCH_SIZE) {
                 const batch = uniqueContacts.slice(i, i + BATCH_SIZE);
@@ -945,7 +962,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
                     for (const step of flowSteps) {
                         try {
-                            await new Promise(resolve => setTimeout(resolve, 50)); // Pequena pausa entre passos
+                            await new Promise(resolve => setTimeout(resolve, 50));
                             let response;
 
                             if (step.type === 'message') {
@@ -998,7 +1015,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                 await Promise.all(promises);
 
                 if (i + BATCH_SIZE < uniqueContacts.length) {
-                    await new Promise(resolve => setTimeout(resolve, 1100)); // Pausa de ~1 segundo entre lotes
+                    await new Promise(resolve => setTimeout(resolve, 1100));
                 }
             }
              await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [historyId]);
