@@ -854,48 +854,108 @@ app.post('/api/bots/remove-contacts', authenticateJwt, async (req, res) => {
     }
 });
 
-app.post('/api/bots/single-send', authenticateJwt, async (req, res) => {
+app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
     const sellerId = req.user.id;
-    const { botId, chatIds, initialText, ctaButtonText, externalLink, imageUrl } = req.body;
+    const { botIds, flowSteps } = req.body;
 
-    if (!botId || !chatIds || chatIds.length === 0 || !initialText) {
-        return res.status(400).json({ message: 'Bot, contatos e texto da mensagem são obrigatórios.' });
+    if (!botIds || botIds.length === 0 || !flowSteps || flowSteps.length === 0) {
+        return res.status(400).json({ message: 'Bots e um fluxo de disparo são obrigatórios.' });
     }
 
     try {
-        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
-        if (!bot || !bot.bot_token) return res.status(404).json({ message: 'Bot não encontrado ou sem token.' });
+        // Resposta imediata para o cliente
+        res.status(202).json({ message: `Disparo agendado. O processo ocorrerá em segundo plano.` });
 
-        res.status(202).json({ message: `Disparo agendado para ${chatIds.length} usuário(s).` });
-
+        // Execução assíncrona
         (async () => {
-            let successCount = 0, failureCount = 0;
-            for (const chatId of chatIds) {
-                const endpoint = imageUrl ? 'sendPhoto' : 'sendMessage';
-                const apiUrl = `https://api.telegram.org/bot${bot.bot_token}/${endpoint}`;
+            const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
+            const hottrackApiKey = seller?.hottrack_api_key;
+
+            for (const botId of botIds) {
+                const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, sellerId]);
+                if (!bot || !bot.bot_token) continue;
+
+                const contacts = await sqlWithRetry('SELECT DISTINCT ON (chat_id) chat_id, first_name, last_name, click_id FROM telegram_chats WHERE bot_id = $1', [botId]);
                 
-                let payload = { chat_id: chatId, caption: initialText, text: initialText, photo: imageUrl, parse_mode: 'HTML' };
-                if (ctaButtonText && externalLink) {
-                    payload.reply_markup = { inline_keyboard: [[{ text: ctaButtonText, url: externalLink }]] };
-                }
+                for (const contact of contacts) {
+                    let userVariables = {
+                        primeiro_nome: contact.first_name || '',
+                        nome_completo: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
+                        click_id: contact.click_id
+                    };
+                    let lastTransactionId = null;
 
-                if (!imageUrl) { delete payload.photo; delete payload.caption; } else { delete payload.text; }
+                    for (const step of flowSteps) {
+                        try {
+                            // Pequeno delay para evitar rate limiting
+                            await new Promise(resolve => setTimeout(resolve, 500));
 
-                try {
-                    await axios.post(apiUrl, payload, { timeout: 10000 });
-                    successCount++;
-                } catch (error) {
-                    failureCount++;
-                    console.error(`Falha ao enviar para ${chatId}: ${error.response?.data?.description || error.message}`);
+                            if (step.type === 'message') {
+                                const textToSend = await replaceVariables(step.text, userVariables);
+                                let payload = { chat_id: contact.chat_id, text: textToSend, parse_mode: 'HTML' };
+                                if (step.buttonText && step.buttonUrl) {
+                                    payload.reply_markup = { inline_keyboard: [[{ text: step.buttonText, url: step.buttonUrl }]] };
+                                }
+                                await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
+
+                            } else if (['image', 'video', 'audio'].includes(step.type)) {
+                                const method = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' }[step.type];
+                                const field = { image: 'photo', video: 'video', audio: 'voice' }[step.type];
+                                const caption = await replaceVariables(step.caption, userVariables);
+                                let payload = { chat_id: contact.chat_id, [field]: step.fileUrl, caption: caption, parse_mode: 'HTML' };
+                                await sendTelegramRequest(bot.bot_token, method, payload);
+
+                            } else if (step.type === 'pix') {
+                                if (!hottrackApiKey) continue;
+                                if (!userVariables.click_id) continue;
+                                
+                                const pixResponse = await axios.post('https://novaapi-one.vercel.app/api/pix/generate', 
+                                    { click_id: userVariables.click_id, value_cents: step.valueInCents }, 
+                                    { headers: { 'x-api-key': hottrackApiKey } }
+                                );
+                                lastTransactionId = pixResponse.data.transaction_id;
+                                
+                                const messageText = await replaceVariables(step.pixMessage, userVariables);
+                                const buttonText = await replaceVariables(step.pixButtonText, userVariables);
+                                const textToSend = `${messageText}\n\n<pre>${pixResponse.data.qr_code_text}</pre>`;
+
+                                await sendTelegramRequest(bot.bot_token, 'sendMessage', {
+                                    chat_id: contact.chat_id,
+                                    text: textToSend,
+                                    parse_mode: 'HTML',
+                                    reply_markup: {
+                                        inline_keyboard: [[{ text: buttonText, copy_text: { text: pixResponse.data.qr_code_text }}]]
+                                    }
+                                });
+
+                            } else if (step.type === 'check_pix') {
+                                if (!hottrackApiKey || !lastTransactionId) continue;
+                                const checkResponse = await axios.get(`https://novaapi-one.vercel.app/api/pix/status/${lastTransactionId}`, { headers: { 'x-api-key': hottrackApiKey } });
+                                
+                                if (checkResponse.data.status === 'PAID') {
+                                    const deliveryText = await replaceVariables(step.deliveryText, userVariables);
+                                    let payload = { chat_id: contact.chat_id, text: deliveryText, parse_mode: 'HTML' };
+                                    if (step.deliveryButtonText && step.deliveryButtonUrl) {
+                                        payload.reply_markup = { inline_keyboard: [[{ text: step.deliveryButtonText, url: step.deliveryButtonUrl }]] };
+                                    }
+                                    await sendTelegramRequest(bot.bot_token, 'sendMessage', payload);
+                                }
+                            }
+                        } catch (error) {
+                            console.error(`Falha no disparo para ${contact.chat_id} no bot ${botId}:`, error.response?.data || error.message);
+                            break; // Pula para o próximo contato em caso de erro
+                        }
+                    }
                 }
-                await new Promise(resolve => setTimeout(resolve, 300));
             }
-            console.log(`Disparo individual concluído. Sucessos: ${successCount}, Falhas: ${failureCount}`);
+            console.log("Processo de disparo em massa concluído.");
         })();
 
     } catch (error) {
-        console.error("Erro no disparo individual:", error);
-        if (!res.headersSent) res.status(500).json({ message: 'Erro ao iniciar o disparo.' });
+        console.error("Erro crítico no agendamento do disparo em massa:", error);
+        if (!res.headersSent) {
+            res.status(500).json({ message: 'Erro interno ao agendar o disparo.' });
+        }
     }
 });
 
