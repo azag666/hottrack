@@ -765,19 +765,26 @@ app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
 
         let importedCount = 0;
         for (const contact of sourceContacts) {
-             const result = await sqlWithRetry(`
-                INSERT INTO telegram_chats 
-                    (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, click_id, message_text, sender_type)
-                VALUES 
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Contato importado via Nova API', 'user')
-                ON CONFLICT (bot_id, chat_id) DO NOTHING;
-            `, [
-                sellerId, destinationBotId, contact.chat_id, (contact.message_id || Date.now()), contact.user_id, 
-                contact.first_name, contact.last_name, contact.username, contact.click_id
-            ]);
-            
-            if (result.count > 0) {
-                importedCount++;
+            // 1. Verifica se o contato já existe
+            const existingContact = await sqlWithRetry(`
+                SELECT id FROM telegram_chats WHERE bot_id = $1 AND chat_id = $2 LIMIT 1
+            `, [destinationBotId, contact.chat_id]);
+
+            // 2. Se não existir, insere
+            if (existingContact.length === 0) {
+                const result = await sqlWithRetry(`
+                    INSERT INTO telegram_chats 
+                        (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, click_id, message_text, sender_type)
+                    VALUES 
+                        ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Contato importado via Nova API', 'user')
+                `, [
+                    sellerId, destinationBotId, contact.chat_id, (contact.message_id || Date.now()), contact.user_id, 
+                    contact.first_name, contact.last_name, contact.username, contact.click_id
+                ]);
+                
+                if (result.count > 0) {
+                    importedCount++;
+                }
             }
         }
         
