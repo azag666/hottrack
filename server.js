@@ -891,7 +891,7 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
 
     try {
         const [history] = await sqlWithRetry(
-            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id`,
+            `INSERT INTO disparo_history (seller_id, campaign_name, bot_ids, flow_steps, status, total_sent) VALUES ($1, $2, $3, $4, 'PENDING', 0) RETURNING id`,
             [sellerId, campaignName, JSON.stringify(botIds), JSON.stringify(flowSteps)]
         );
         const historyId = history.id;
@@ -899,7 +899,6 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
         res.status(202).json({ message: `Disparo "${campaignName}" agendado com sucesso! O processo ocorrerá em segundo plano.` });
 
         (async () => {
-            let totalProcessed = 0;
             const [seller] = await sqlWithRetry('SELECT hottrack_api_key FROM sellers WHERE id = $1', [sellerId]);
             const hottrackApiKey = seller?.hottrack_api_key;
             
@@ -915,7 +914,6 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                  });
             }
             const uniqueContacts = Array.from(allContacts.values());
-            totalProcessed = uniqueContacts.length;
 
             for (const contact of uniqueContacts) {
                 const [bot] = await sqlWithRetry('SELECT seller_id, bot_token FROM telegram_bots WHERE id = $1', [contact.bot_id_source]);
@@ -979,8 +977,11 @@ app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
                     `INSERT INTO disparo_log (history_id, chat_id, bot_id, status, transaction_id) VALUES ($1, $2, $3, $4, $5)`,
                     [historyId, contact.chat_id, contact.bot_id_source, logStatus, lastTransactionId]
                 );
+
+                // ATUALIZAÇÃO EM TEMPO REAL
+                await sqlWithRetry(`UPDATE disparo_history SET total_sent = total_sent + 1 WHERE id = $1`, [historyId]);
             }
-             await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED', total_sent = $2 WHERE id = $1`, [historyId, totalProcessed]);
+             await sqlWithRetry(`UPDATE disparo_history SET status = 'COMPLETED' WHERE id = $1`, [historyId]);
         })();
 
     } catch (error) {
