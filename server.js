@@ -80,15 +80,12 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     let messageText = text;
     let newClickId = null;
 
-    // Verifica se há um novo click_id a partir de um comando /start
     if (text && text.startsWith('/start ')) {
         newClickId = text.substring(7);
     }
 
-    // Determina o click_id a ser salvo com a mensagem
     let finalClickId = newClickId;
     if (!finalClickId) {
-        // Se não houver um novo click_id, busca o existente para a conversa
         const result = await sqlWithRetry(
             'SELECT click_id FROM telegram_chats WHERE chat_id = $1 AND bot_id = $2 AND click_id IS NOT NULL ORDER BY created_at DESC LIMIT 1',
             [chat.id, botId]
@@ -114,14 +111,12 @@ async function saveMessageToDb(sellerId, botId, message, senderType) {
     const botInfo = senderType === 'bot' ? { first_name: 'Bot', last_name: '(Fluxo)' } : {};
     const fromUser = from || chat;
 
-    // Insere a nova mensagem com o click_id determinado
     await sqlWithRetry(`
         INSERT INTO telegram_chats (seller_id, bot_id, chat_id, message_id, user_id, first_name, last_name, username, message_text, sender_type, media_type, media_file_id, click_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (chat_id, message_id) DO NOTHING;
     `, [sellerId, botId, chat.id, message_id, fromUser.id, fromUser.first_name || botInfo.first_name, fromUser.last_name || botInfo.last_name, fromUser.username || null, messageText, senderType, mediaType, mediaFileId, finalClickId]);
 
-    // Se houver um novo click_id, atualiza todas as mensagens anteriores desta conversa para garantir consistência
     if (newClickId) {
         await sqlWithRetry(
             'UPDATE telegram_chats SET click_id = $1 WHERE chat_id = $2 AND bot_id = $3',
@@ -264,7 +259,16 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     await sqlWithRetry('UPDATE user_flow_states SET variables = $1 WHERE chat_id = $2 AND bot_id = $3', [JSON.stringify(variables), chatId, botId]);
                     const customText = nodeData.pixMessageText || '✅ PIX Gerado! Copie o código abaixo para pagar:';
                     const textToSend = `${customText}\n\n<code>${response.data.qr_code_text}</code>`;
-                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+                    const sentMessage = await sendTelegramRequest(botToken, 'sendMessage', {
+                        chat_id: chatId,
+                        text: textToSend,
+                        parse_mode: 'HTML',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Copiar Código PIX', switch_inline_query_current_chat: response.data.qr_code_text }]
+                            ]
+                        }
+                    });
                     if (sentMessage.ok) {
                         await saveMessageToDb(sellerId, botId, sentMessage.result, 'bot');
                     }
@@ -525,7 +529,16 @@ app.post('/api/chats/generate-pix', authenticateJwt, async (req, res) => {
 
         const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1', [botId]);
         const textToSend = `✅ PIX Gerado! Copie o código abaixo para pagar:\n\n<code>${qr_code_text}</code>`;
-        const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', { chat_id: chatId, text: textToSend, parse_mode: 'HTML' });
+        const sentMessage = await sendTelegramRequest(bot.bot_token, 'sendMessage', {
+            chat_id: chatId,
+            text: textToSend,
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: 'Copiar Código PIX', switch_inline_query_current_chat: qr_code_text }]
+                ]
+            }
+        });
 
         if (sentMessage.ok) {
             await saveMessageToDb(req.user.id, botId, sentMessage.result, 'operator');
