@@ -232,39 +232,53 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 }
                 break;
             }
-            case 'image': case 'video': {
-                const typeMap = { image: 'sendPhoto', video: 'sendVideo' };
-                const urlMap = { image: 'imageUrl', video: 'videoUrl' };
-                const fieldMap = { image: 'photo', video: 'video' };
+            case 'image': case 'video': case 'audio': {
+                const typeMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+                const urlMap = { image: 'imageUrl', video: 'videoUrl', audio: 'audioUrl' };
+                const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+                
                 const method = typeMap[currentNode.type];
                 let fileIdentifier = nodeData[urlMap[currentNode.type]];
                 const caption = await replaceVariables(nodeData.caption, variables);
-                let response;
+                
                 if (fileIdentifier) {
                     const isLibraryFile = fileIdentifier.startsWith('BAAC') || fileIdentifier.startsWith('AgAC') || fileIdentifier.startsWith('AwAC');
+                    
                     if (isLibraryFile) {
-                         // Lógica para enviar da biblioteca...
-                    } else {
-                        const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier, caption };
-                        response = await sendTelegramRequest(botToken, method, payload);
+                        try {
+                            const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
+                            if (storageBotToken) {
+                                const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileIdentifier });
+                                if (fileInfo.ok) {
+                                    fileIdentifier = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.result.file_path}`;
+                                } else {
+                                    throw new Error('Não foi possível obter o caminho do arquivo do Telegram.');
+                                }
+                            } else {
+                                throw new Error('Token do bot de armazenamento não configurado.');
+                            }
+                        } catch (e) {
+                            console.error("Falha ao obter URL do arquivo da biblioteca", e.message);
+                            // Se falhar, pula para o próximo nó para não travar o fluxo
+                            currentNodeId = findNextNode(currentNodeId, 'a', edges);
+                            continue; // Pula a execução do envio
+                        }
                     }
+
+                    if (currentNode.type === 'audio') {
+                        const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
+                        if (duration > 0) {
+                            await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
+                            await new Promise(resolve => setTimeout(resolve, duration * 1000));
+                        }
+                    }
+
+                    const payload = { chat_id: chatId, [fieldMap[currentNode.type]]: fileIdentifier, caption };
+                    const response = await sendTelegramRequest(botToken, method, payload);
+
                     if (response && response.ok) {
                         await saveMessageToDb(sellerId, botId, response.result, 'bot');
                     }
-                }
-                currentNodeId = findNextNode(currentNodeId, 'a', edges);
-                break;
-            }
-            case 'audio': {
-                const duration = parseInt(nodeData.durationInSeconds, 10) || 0;
-                if (duration > 0) {
-                    await sendTelegramRequest(botToken, 'sendChatAction', { chat_id: chatId, action: 'record_voice' });
-                    await new Promise(resolve => setTimeout(resolve, duration * 1000));
-                }
-                let fileIdentifier = nodeData.audioUrl;
-                if (fileIdentifier) {
-                    const response = await sendTelegramRequest(botToken, 'sendVoice', { chat_id: chatId, voice: fileIdentifier });
-                    if (response && response.ok) await saveMessageToDb(sellerId, botId, response.result, 'bot');
                 }
                 currentNodeId = findNextNode(currentNodeId, 'a', edges);
                 break;
@@ -538,6 +552,49 @@ app.post('/api/chats/:botId/send-message', authenticateJwt, async (req, res) => 
         res.status(200).json({ message: 'Mensagem enviada!' });
     } catch (error) { res.status(500).json({ message: 'Não foi possível enviar a mensagem.' }); }
 });
+
+// Endpoint para envio de mídia da biblioteca no chat ao vivo
+app.post('/api/chats/:botId/send-library-media', authenticateJwt, async (req, res) => {
+    const { chatId, fileId, fileType } = req.body;
+    const { botId } = req.params;
+
+    if (!chatId || !fileId || !fileType) {
+        return res.status(400).json({ message: 'Dados incompletos.' });
+    }
+
+    try {
+        const [bot] = await sqlWithRetry('SELECT bot_token FROM telegram_bots WHERE id = $1 AND seller_id = $2', [botId, req.user.id]);
+        if (!bot) return res.status(404).json({ message: 'Bot não encontrado.' });
+
+        const storageBotToken = process.env.TELEGRAM_STORAGE_BOT_TOKEN;
+        if (!storageBotToken) throw new Error('Token do bot de armazenamento não configurado.');
+
+        const fileInfo = await sendTelegramRequest(storageBotToken, 'getFile', { file_id: fileId });
+        if (!fileInfo.ok) throw new Error('Não foi possível obter informações do arquivo da biblioteca.');
+
+        const fileUrl = `https://api.telegram.org/file/bot${storageBotToken}/${fileInfo.result.file_path}`;
+
+        const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+        const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
+
+        const method = methodMap[fileType];
+        const field = fieldMap[fileType];
+
+        if (!method) return res.status(400).json({ message: 'Tipo de arquivo não suportado.' });
+        
+        const response = await sendTelegramRequest(bot.bot_token, method, { chat_id: chatId, [field]: fileUrl });
+
+        if (response.ok) {
+            await saveMessageToDb(req.user.id, botId, response.result, 'operator');
+            res.status(200).json({ message: 'Mídia enviada!' });
+        } else {
+            throw new Error('Falha ao enviar mídia para o usuário final.');
+        }
+    } catch (error) {
+        res.status(500).json({ message: 'Não foi possível enviar a mídia: ' + error.message });
+    }
+});
+
 app.post('/api/chats/:botId/send-media', authenticateJwt, async (req, res) => {
     const { chatId, fileData, fileType, fileName } = req.body;
     if (!chatId || !fileData || !fileType || !fileName) {
