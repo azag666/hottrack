@@ -796,6 +796,28 @@ app.post('/api/novaapi/import', authenticateJwt, async (req, res) => {
     }
 });
 
+// --- ROTA PARA CONTAR CONTATOS --
+app.post('/api/bots/contacts-count', authenticateJwt, async (req, res) => {
+    const { botIds } = req.body;
+    const sellerId = req.user.id;
+
+    if (!botIds || !Array.isArray(botIds) || botIds.length === 0) {
+        return res.status(400).json({ message: 'Uma lista de IDs de bots é obrigatória.' });
+    }
+
+    try {
+        const result = await sqlWithRetry(
+            `SELECT COUNT(DISTINCT chat_id) FROM telegram_chats WHERE seller_id = $1 AND bot_id = ANY($2::int[])`,
+            [sellerId, botIds]
+        );
+        res.status(200).json({ count: parseInt(result[0].count, 10) });
+    } catch (error) {
+        console.error("Erro ao contar contatos:", error);
+        res.status(500).json({ message: 'Erro interno ao contar contatos.' });
+    }
+});
+
+
 // --- NOVAS ROTAS PARA VALIDAÇÃO E DISPAROS ---
 app.post('/api/bots/mass-send', authenticateJwt, async (req, res) => {
     const sellerId = req.user.id;
