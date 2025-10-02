@@ -64,7 +64,7 @@ function findNextNode(currentNodeId, handleId, edges) {
 }
 
 async function sendTelegramRequest(botToken, method, data, options = {}, retries = 3, delay = 1500) {
-    const { headers = {}, responseType = 'json', timeout = 30000 } = options; // Timeout aumentado para 30s
+    const { headers = {}, responseType = 'json', timeout = 30000 } = options; // Timeout de 30s
     const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
 
     for (let i = 0; i < retries; i++) {
@@ -470,8 +470,25 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const bot = botResult[0];
                     if (bot) {
                         const initialVars = JSON.parse(timeout.variables || '{}');
-                        const flowData = initialVars.flow_data ? JSON.parse(initialVars.flow_data) : null;
+                        
+                        // ===== CORREÇÃO PARA O ERRO DE JSON =====
+                        let flowData = null;
+                        if (initialVars.flow_data) {
+                            if (typeof initialVars.flow_data === 'string') {
+                                try {
+                                    flowData = JSON.parse(initialVars.flow_data);
+                                } catch (e) {
+                                    console.error(`Erro ao decodificar flow_data para o chat ${timeout.chat_id}:`, e);
+                                    continue; // Pula este timeout problemático
+                                }
+                            } else {
+                                flowData = initialVars.flow_data; // Já é um objeto
+                            }
+                        }
+                        // ===== FIM DA CORREÇÃO =====
+
                         if (initialVars.flow_data) delete initialVars.flow_data;
+                        
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
                     }
                 }
