@@ -78,6 +78,15 @@ async function sendTelegramRequest(botToken, method, data, options = {}, retries
             });
             return response.data;
         } catch (error) {
+            const chatId = data instanceof FormData ? data.getBoundary && data.get('chat_id') : data.chat_id;
+
+            // ===== CORREÇÃO PARA ERRO DE BLOQUEIO (403) =====
+            if (error.response && error.response.status === 403) {
+                console.warn(`[TELEGRAM API WARN] O bot foi bloqueado pelo usuário. ChatID: ${chatId}`);
+                return { ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' }; // Retorna um erro controlado
+            }
+            // ===== FIM DA CORREÇÃO =====
+
             const isRetryable = error.code === 'ECONNABORTED' || error.code === 'ECONNRESET' || error.message.includes('socket hang up');
 
             if (isRetryable && i < retries - 1) {
@@ -89,8 +98,6 @@ async function sendTelegramRequest(botToken, method, data, options = {}, retries
             const errorMessage = (errorData instanceof ArrayBuffer)
                 ? JSON.parse(Buffer.from(errorData).toString('utf8'))
                 : errorData;
-            
-            const chatId = data instanceof FormData ? data.getBoundary && data.get('chat_id') : data.chat_id;
 
             console.error(`[TELEGRAM API ERROR] Method: ${method}, ChatID: ${chatId}:`, errorMessage || error.message);
             throw error;
