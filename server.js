@@ -325,7 +325,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
-                        await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
+                        // ===== CORREÇÃO PARA O ERRO DE JSON (1/2) =====
+                        const timeoutVariables = { ...variables, flow_data: currentFlowData };
+                        await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify(timeoutVariables)]);
                     }
                     shouldCleanup = false;
                     currentNodeId = null;
@@ -354,7 +356,9 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const delaySeconds = parseInt(nodeData.delayInSeconds, 10) || 1;
                 const nextNodeId = findNextNode(currentNodeId, null, edges);
                 if (nextNodeId) {
-                    await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify({ ...variables, flow_data: JSON.stringify(currentFlowData) })]);
+                    // ===== CORREÇÃO PARA O ERRO DE JSON (2/2) =====
+                    const timeoutVariables = { ...variables, flow_data: currentFlowData };
+                    await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify(timeoutVariables)]);
                 }
                 shouldCleanup = false;
                 currentNodeId = null; 
@@ -470,23 +474,8 @@ app.get('/api/cron/process-timeouts', async (req, res) => {
                     const bot = botResult[0];
                     if (bot) {
                         const initialVars = JSON.parse(timeout.variables || '{}');
+                        const flowData = initialVars.flow_data || null;
                         
-                        // ===== CORREÇÃO PARA O ERRO DE JSON =====
-                        let flowData = null;
-                        if (initialVars.flow_data) {
-                            if (typeof initialVars.flow_data === 'string') {
-                                try {
-                                    flowData = JSON.parse(initialVars.flow_data);
-                                } catch (e) {
-                                    console.error(`Erro ao decodificar flow_data para o chat ${timeout.chat_id}:`, e);
-                                    continue; // Pula este timeout problemático
-                                }
-                            } else {
-                                flowData = initialVars.flow_data; // Já é um objeto
-                            }
-                        }
-                        // ===== FIM DA CORREÇÃO =====
-
                         if (initialVars.flow_data) delete initialVars.flow_data;
                         
                         processFlow(timeout.chat_id, timeout.bot_id, bot.bot_token, bot.seller_id, timeout.target_node_id, initialVars, flowData);
