@@ -325,7 +325,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                     const timeoutMinutes = nodeData.replyTimeout || 5;
                     const noReplyNodeId = findNextNode(currentNode.id, 'b', edges);
                     if (noReplyNodeId) {
-                        // ===== CORREÇÃO PARA O ERRO DE JSON (1/2) =====
                         const timeoutVariables = { ...variables, flow_data: currentFlowData };
                         await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${timeoutMinutes} minutes', $3, $4)`, [chatId, botId, noReplyNodeId, JSON.stringify(timeoutVariables)]);
                     }
@@ -356,7 +355,6 @@ async function processFlow(chatId, botId, botToken, sellerId, startNodeId = null
                 const delaySeconds = parseInt(nodeData.delayInSeconds, 10) || 1;
                 const nextNodeId = findNextNode(currentNodeId, null, edges);
                 if (nextNodeId) {
-                    // ===== CORREÇÃO PARA O ERRO DE JSON (2/2) =====
                     const timeoutVariables = { ...variables, flow_data: currentFlowData };
                     await sqlWithRetry(`INSERT INTO flow_timeouts (chat_id, bot_id, execute_at, target_node_id, variables) VALUES ($1, $2, NOW() + INTERVAL '${delaySeconds} seconds', $3, $4)`, [chatId, botId, nextNodeId, JSON.stringify(timeoutVariables)]);
                 }
