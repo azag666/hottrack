@@ -227,7 +227,7 @@ async function handleMediaNode(node, botToken, chatId, caption) {
         }
         response = await sendMediaAsProxy(botToken, chatId, fileIdentifier, type, caption);
     } else {
-        const methodMap = { image: 'sendPhoto', video: 'sendVideo', audio: 'sendVoice' };
+        const methodMap = { image: 'sendPhot', video: 'sendVideo', audio: 'sendVoice' };
         const fieldMap = { image: 'photo', video: 'video', audio: 'voice' };
         
         const method = methodMap[type];
